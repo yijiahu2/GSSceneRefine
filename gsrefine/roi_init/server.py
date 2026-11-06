@@ -254,7 +254,8 @@ def main(argv=None):
     parser.add_argument('--gaussian-ply',help='Original complete 3DGS Gaussian PLY')
     parser.add_argument('--colmap-images',help='COLMAP images.bin for this coordinate frame (optional if configured)')
     parser.add_argument('--sfm-dir',help='COLMAP sparse directory containing points3D.bin and images.bin')
-    parser.add_argument('--output-dir',help='Final result ROOT; each confirmed ROI gets its own subdirectory')
+    parser.add_argument('--output-dir',required=True,help='All run outputs: geometry, ROI, result, logs and temporary files')
+    parser.add_argument('--keep-diagnostics',action='store_true',help='Keep all research/debug masks, PLYs and tables')
     args=parser.parse_args(argv)
     points, images = expand_colmap_inputs(args.sfm_dir, colmap_points=args.colmap_points,
                                           colmap_images=args.colmap_images)
@@ -287,7 +288,8 @@ def main(argv=None):
         print('[roi-init] Windows model service log:',log,flush=True)
     else:
         print('[roi-init] Windows service must be started independently on port',settings.file_port,flush=True)
-    workflow=WorkflowManager(settings.config,settings=settings)
+    workflow=WorkflowManager(settings.config,settings=settings,
+                             keep_diagnostics=args.keep_diagnostics)
     # The browser is only an annotation surface. After ROI confirmation its
     # HTTP server is handed off to the WSL terminal and permanently closed.
     meta['workflow']['terminal_handoff']=workflow.enabled
@@ -318,6 +320,8 @@ def main(argv=None):
             windows_proc.terminate()
             try:windows_proc.wait(timeout=4)
             except Exception:windows_proc.kill()
+    # Module-2 preview is temporary and not required by later stages.
+    shutil.rmtree(settings.out_dir / '.poisson_display_cache', ignore_errors=True)
     if workflow.launched_job() and not interrupted:
         print('[pipeline] [2/4] ROI已保存；网页服务已关闭，后续在终端显示。',flush=True)
         status=monitor_terminal(workflow)

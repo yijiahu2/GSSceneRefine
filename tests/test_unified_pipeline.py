@@ -85,10 +85,14 @@ def test_confirm_starts_existing_module3_and4_command(tmp_path, monkeypatch):
         # Exit code 0 alone is NOT enough to report completion.
         assert get('/api/workflow-status')['status'] == 'failed'
         out = Path(first['workflow']['output_dir'])
-        model = out / 'gaussians_final_R3.ply'
+        model = out / 'final/gaussian_roi.ply'
+        model.parent.mkdir(parents=True, exist_ok=True)
         model.write_bytes(b'valid-mock-ply')
         from gsrefine.roi_init.workflow import _sha
-        (out / 'workflow_result.json').write_text(json.dumps({
+        (out / 'metadata').mkdir(parents=True,exist_ok=True)
+        (out / 'metadata/manifest.json').write_text(json.dumps({
+            'status': 'completed', 'stage2_inputs': {'gaussian_ply': str(model)}}))
+        (out / 'metadata/workflow_result.json').write_text(json.dumps({
             'final_ply': str(model), 'roi': first['saved_path'],
             'roi_sha256': _sha(first['saved_path']), 'R0_gaussians': 5,
             'final_gaussians': 7, 'added_gaussians': 2,
@@ -127,12 +131,14 @@ def test_manual_pipeline_dispatch_and_immutable_source(tmp_path, monkeypatch):
     assert len(calls) == 1
     assert {key:value for key,value in calls[0].items() if key != 'progress_callback'} == {
         'run_ablation': True, 'final_only': True, 'export_final': True,
-        'final_method': 'R3'}
+        'final_method': 'R3', 'save_diagnostics': False, 'save_indices': False}
     assert callable(calls[0]['progress_callback'])
     assert result['final_gaussians'] == 15
-    assert result['final_ply'].endswith('gaussians_final_R3.ply')
+    assert result['final_ply'].endswith('final/gaussian_roi.ply')
+    assert not list(Path(result['output_dir']).glob('.work-*'))
+    assert Path(result['manifest']).is_file()
     assert _sha_same(settings.gaussian_ply, source_sha)
-    assert output_for_roi(cfg, roi).name == roi.stem
+    assert output_for_roi(cfg, roi).name == 'roi_001'
 
 
 def _sha_same(path, value):
@@ -185,19 +191,14 @@ def test_real_http_confirm_to_final_R3_ply(tmp_path):
         final = GaussianPLY(status['final_ply'])
         assert final.vertex_count == status['final_gaussians']
         out = Path(status['output_dir'])
-        core = np.load(out / 'core_mask_R3.npy')
-        safety = np.load(out / 'safety_added_mask_R3.npy')
-        assert not np.any(core & safety)
-        assert int((core | safety).sum()) == final.vertex_count
         assert status['added_gaussians'] >= 0
         assert status['core_restored_gaussians'] + status['safety_added_gaussians'] == status['added_gaussians']
-        assert not (out / 'keep_mask_R1.npy').exists()
-        assert not (out / 'keep_mask_R2.npy').exists()
-        # Preserve the original research/diagnostic output contract.
-        assert (out / 'candidate_groups.json').exists()
-        assert (out / 'full_exterior_faces.npz').exists()
-        assert (out / 'kept_indices_R3.npy').exists()
-        assert (out / 'restored_indices_R3.npy').exists()
+        assert (out / 'metadata/manifest.json').is_file()
+        assert (out / 'metadata/processing_report.json').is_file()
+        assert (out / 'logs/processing.log').is_file()
+        assert not (out / 'diagnostics').exists()
+        assert not list(out.glob('.work-*'))
+        assert not (out / 'core_mask_R3.npy').exists()
     finally:
         server.shutdown()
         server.server_close()

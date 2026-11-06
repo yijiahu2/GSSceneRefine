@@ -45,7 +45,7 @@ def _resolve_gaussian(study_dir: Path, report: dict, config_path=None, gaussian_
 
 def finalize(study_dir, *, method='R3', config_path=None, gaussian_path=None,
              output_path=None, report=None, source_ply=None,
-             verify_input_hash=True) -> dict:
+             verify_input_hash=True, save_indices=True) -> dict:
     """Export a selected, validated kept-Gaussian PLY using cached mask only.
 
     Refuses a modified source PLY, mismatched masks or a keep mask that drops R0.
@@ -142,8 +142,9 @@ def finalize(study_dir, *, method='R3', config_path=None, gaussian_path=None,
     index_type = np.uint32 if n <= np.iinfo(np.uint32).max else np.uint64
     kept_index_path = study_dir / f'kept_indices_{method}.npy'
     restored_index_path = study_dir / f'restored_indices_{method}.npy'
-    np.save(kept_index_path, kept_ids.astype(index_type))
-    np.save(restored_index_path, restored_ids.astype(index_type))
+    if save_indices:
+        np.save(kept_index_path, kept_ids.astype(index_type))
+        np.save(restored_index_path, restored_ids.astype(index_type))
 
     scope = (config or {}).get('source_model_scope')
     if scope is None:
@@ -168,8 +169,8 @@ def finalize(study_dir, *, method='R3', config_path=None, gaussian_path=None,
         'output_size_bytes': destination.stat().st_size,
         'keep_mask_path': str(selected_path),
         'keep_mask_sha256': file_sha256(selected_path),
-        'kept_indices_path': str(kept_index_path),
-        'restored_indices_path': str(restored_index_path),
+        'kept_indices_path': str(kept_index_path) if save_indices else None,
+        'restored_indices_path': str(restored_index_path) if save_indices else None,
         'output_sha256': file_sha256(destination),
         'validated': {
             'source_sha256_matches_study': True if verify_input_hash else None,

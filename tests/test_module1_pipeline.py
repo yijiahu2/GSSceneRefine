@@ -57,12 +57,12 @@ def test_auto_prepares_and_reuses_identical_geometry(tmp_path, monkeypatch):
     assert Path(data['paths']['clean_sfm_npz']).is_file()
     assert data['paths']['gaussian_ply'] == str(tmp_path / 'model.ply')
     assert (tmp_path / 'model.ply').read_bytes() == before
-    assert (tmp_path / 'geometry_cache/poisson_vertex_density.npy').is_file()
-    assert (tmp_path / 'geometry_cache/reconstruction_report_poisson.json').is_file()
+    assert not (tmp_path / 'geometry_cache/poisson_vertex_density.npy').exists()
+    assert (tmp_path / 'geometry_cache/metadata/poisson_reconstruction_report.json').is_file()
     assert geo.prepare_scene(cfg) == active
     assert len(called) == 1
     assert geo.prepare_scene(active) == active
-    assert json.loads((tmp_path / 'geometry_cache/module1_status.json').read_text())['cached']
+    assert json.loads((tmp_path / 'geometry_cache/logs/module1_status.json').read_text())['cached']
     # Replacing SfM with another reconstruction under the same scene would
     # invalidate previously saved ROIs across methods, so fail closed.
     sfm_source.write_bytes(b'changed COLMAP reconstruction')
@@ -105,7 +105,8 @@ def test_cli_raw_inputs_create_runtime_without_overwriting_baseline(tmp_path, mo
     full = tmp_path / 'complete.ply'
     full.write_bytes((tmp_path / 'model.ply').read_bytes())
     from gsrefine.geometry.prepare import prepare_input_config
-    prepared_config = prepare_input_config(config, colmap_points=source, gaussian_ply=full)
+    prepared_config = prepare_input_config(config, colmap_points=source, gaussian_ply=full,
+                                            final_output_root=tmp_path/'generated_results')
     assert prepared_config.is_file()
     configured = yaml.safe_load(prepared_config.read_text())
     assert configured['module1']['mode'] == 'auto'
@@ -182,7 +183,9 @@ def test_user_defined_sfm_folder_and_final_output_root(tmp_path, monkeypatch):
     roi = tmp_path / 'confirmed_roi_007.json'
     roi.write_text(json.dumps({'annotation_metadata': {
         'source_ply': str(gaussian), 'method': data['scene']['method']}}))
-    assert output_for_roi(prepared, roi) == root / 'confirmed_roi_007'
+    assert output_for_roi(prepared, roi) == root / 'examplecliff/methods/absgs/roi_007'
+    assert data['roi_init']['output_dir'] == str(root/'examplecliff/roi')
+    assert data['module1']['output_dir'] == str(root/'examplecliff/geometry')
 
     captured = []
     class StopBeforeBuilding(Exception):

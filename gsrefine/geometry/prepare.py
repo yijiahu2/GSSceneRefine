@@ -1,7 +1,7 @@
 """Module 1 orchestrator: raw COLMAP SfM -> cleaned points -> Poisson reference.
 
-Only the *prepared geometry artifacts* and an effective runtime YAML live under
-runs/geometry/<scene>. Original reconstruction, Gaussian PLY and scene YAML are
+Prepared geometry artifacts and effective runtime YAML live under the user
+selected --output-dir/<scene>/geometry. Original reconstruction, Gaussian PLY and scene YAML are
 never modified. Existing-reference mode is kept for previously validated scenes.
 
 The module does NOT claim a generated Poisson mesh is semantically ground truth:
@@ -73,7 +73,7 @@ def _p(path, *, base=PROJECT_ROOT):
 def _status(output, phase, message, **values):
     data = dict(schema='GSSceneRefine.module1.status.v1', phase=phase,
                 detail=message, timestamp_utc=datetime.now(timezone.utc).isoformat(), **values)
-    _write_json_atomic(Path(output) / 'module1_status.json', data)
+    _write_json_atomic(Path(output) / 'logs' / 'module1_status.json', data)
     print(f'[module1] {message}', flush=True)
 
 
@@ -102,7 +102,7 @@ def _source_signature(source, sfm_args, poisson_args):
 
 def _outputs_ok(directory, signature):
     try:
-        manifest = json.loads((directory / 'module1_manifest.json').read_text(encoding='utf8'))
+        manifest = json.loads((directory / 'metadata' / 'geometry_manifest.json').read_text(encoding='utf8'))
         if manifest.get('signature') != signature:
             return False
         for filename, props in manifest['outputs'].items():
@@ -238,13 +238,18 @@ def prepare_input_config(config, *, colmap_points=None, gaussian_ply=None,
         raise GeometryPreparationError('A new scene requires its own --colmap-points and --colmap-images; never inherit another COLMAP frame')
     sd['name'], sd['method'] = requested_scene, requested_method
     block = data.setdefault('module1', {})
-    out = PROJECT_ROOT / 'runs' / 'geometry' / requested_scene
-    # Keep explicitly configured output directory only for the same scene.
-    if not scene or original_scene == requested_scene:
-        out = _p(block.get('output_dir', f'runs/geometry/{requested_scene}'))
+    if final_output_root is not None:
+        from gsrefine.roi_init.output_layout import scene_dir
+        output_root = Path(final_output_root).expanduser().resolve()
+        out = scene_dir(output_root, requested_scene) / 'geometry'
+    else:
+        # Old programmatic callers may still use their configured directory.
+        out = PROJECT_ROOT / 'runs' / 'geometry' / requested_scene
+        if not scene or original_scene == requested_scene:
+            out = _p(block.get('output_dir', f'runs/geometry/{requested_scene}'))
     source = colmap_points or block.get('colmap_points') or data['paths'].get('colmap_points')
     if not source:
-        manifest = out / 'module1_manifest.json'
+        manifest = out / 'metadata' / 'geometry_manifest.json'
         if manifest.is_file():
             source = json.loads(manifest.read_text(encoding='utf8')).get('source')
     if not source:
@@ -286,13 +291,53 @@ def prepare_input_config(config, *, colmap_points=None, gaussian_ply=None,
         # This is the parent of per-confirmed-ROI output directories. It must
         # not be confused with module1.output_dir (geometry cache).
         data.setdefault('workflow', {})['output_root'] = str(final_root)
+        # One authoritative output root. Do not write any run files into source.
+        init['output_dir'] = str(final_root / requested_scene / 'roi')
+        orientation['cache_dir'] = str(final_root / requested_scene / 'geometry' / 'orientation')
+        data['paths']['output_dir'] = str(final_root / requested_scene / 'methods' / requested_method)
     # For the same scene, preserve legacy orientation settings. New scenes
     # explicitly require images.bin, enforced above.
     out.mkdir(parents=True, exist_ok=True)
     source_key = hashlib.sha256(str(model).encode('utf8')).hexdigest()[:10]
-    runtime_config = out / f'input_scene__{requested_method}__{source_key}.yaml'
+    runtime_config = out / 'runtime' / f'input_{requested_method}__{source_key}.yaml'
     _write_yaml_atomic(runtime_config, data)
     return runtime_config
+
+def relocate_existing_reference_config(config, output_root):
+    """Run an existing, read-only SfM/Poisson reference under a new output root.
+
+    Legacy configs may have usable precomputed geometry but no raw
+    ``points3D.bin``. Only their existing geometry files are read; runtime
+    YAML, ROI records, orientation cache, logs and final outputs are relocated.
+    Never use this for a new scene or to bypass original-frame verification.
+    """
+    import re
+    config = Path(config).expanduser().resolve(strict=True)
+    output_root = Path(output_root).expanduser().resolve()
+    data = yaml.safe_load(config.read_text(encoding='utf8')) or {}
+    paths = data.get('paths', {})
+    scene_def = data.get('scene', {})
+    scene, method = scene_def.get('name'), scene_def.get('method')
+    pattern = re.compile(r'^[a-zA-Z][a-zA-Z0-9_-]{0,50}$')
+    if not pattern.fullmatch(str(scene)) or not pattern.fullmatch(str(method)):
+        raise GeometryPreparationError('Legacy reference must specify valid scene.name and scene.method')
+    for label, key in [('SfM', 'clean_sfm_npz'), ('Poisson', 'poisson_raw'),
+                       ('Gaussian', 'gaussian_ply')]:
+        if not paths.get(key) or not _p(paths[key]).is_file():
+            raise GeometryPreparationError(
+                f'Missing existing {label} reference ({key}); provide original --sfm-dir for Module 1')
+    # Legacy read-only reference is allowed for the SAME method.
+    # Cross-method reuse still requires the full-scene scope check.
+    target = output_root / scene / 'geometry' / 'runtime' / f'legacy_reference_{method}.yaml'
+    data.setdefault('module1', {})['mode'] = 'reuse'
+    data.setdefault('roi_init', {})['output_dir'] = str(output_root / scene / 'roi')
+    data['roi_init'].setdefault('orientation', {})['cache_dir'] = str(
+        output_root / scene / 'geometry' / 'orientation')
+    data.setdefault('workflow', {})['output_root'] = str(output_root)
+    data.setdefault('paths', {})['output_dir'] = str(output_root / scene / 'methods' / method)
+    _write_yaml_atomic(target, data)
+    return target
+
 
 def prepare_scene(config):
     """Return an effective config path, preparing stage 1 if explicitly enabled.
@@ -348,15 +393,15 @@ def prepare_scene(config):
     signature, material = _source_signature(source, sfm_opts, p_opts)
     # The user may change reconstruction methods, never silently switch a
     # scene to a different COLMAP reference frame.
-    old_manifest = out_dir / 'module1_manifest.json'
+    old_manifest = out_dir / 'metadata' / 'geometry_manifest.json'
     if old_manifest.is_file():
         old = json.loads(old_manifest.read_text(encoding='utf8'))
         former = old.get('signature_material', {}).get('colmap_points_sha256')
         if former and former != material['colmap_points_sha256']:
             raise GeometryPreparationError('COLMAP points changed under one scene identity. '
                                            'Assign a different scene name or deliberately archive the old geometry cache.')
-    clean_path = out_dir / '02_sfm_clean_colmap_metadata.npz'
-    mesh_path = out_dir / '04_poisson_raw.ply'
+    clean_path = out_dir / 'cleaned_sfm.npz'
+    mesh_path = out_dir / 'poisson_surface.ply'
     cached = _outputs_ok(out_dir, signature)
     if cached:
         _status(out_dir, 'cached', '模块一缓存有效：复用SfM净化与Poisson曲面', cached=True)
@@ -379,19 +424,19 @@ def prepare_scene(config):
                     clean_points=int(mask.sum()))
             poisson_stage = stage / 'poisson'
             make_poisson(clean, poisson_stage, **p_opts)
-            output_mesh = poisson_stage / mesh_path.name
+            output_mesh = poisson_stage / '04_poisson_raw.ply'
             _status(out_dir, 'verifying', '模块一：核验SfM、Poisson及Gaussian坐标',
                     clean_points=int(mask.sum()))
             quality = _check_geometry(clean, output_mesh, gaussian)
             # Publish only complete validated results; never overwrite original
             # SfM/Poisson outside our dedicated runs/geometry directory.
             for old, new in [(clean, clean_path), (output_mesh, mesh_path),
-                             (stage / 'sfm_clean_report.json', out_dir / 'sfm_clean_report.json'),
-                             (poisson_stage / 'poisson_vertex_density.npy', out_dir / 'poisson_vertex_density.npy'),
-                             (poisson_stage / 'reconstruction_report_poisson.json', out_dir / 'reconstruction_report_poisson.json')]:
+                             (stage / 'sfm_clean_report.json', out_dir / 'metadata' / 'sfm_clean_report.json'),
+                             (poisson_stage / 'reconstruction_report_poisson.json', out_dir / 'metadata' / 'poisson_reconstruction_report.json')]:
                 if old.exists():
+                    new.parent.mkdir(parents=True, exist_ok=True)
                     os.replace(old, new)
-            _write_json_atomic(out_dir / 'geometry_quality_report.json', quality)
+            # Independent per-model QA is written below, even when geometry is cached.
             manifest = dict(schema='GSSceneRefine.module1.manifest.v1', signature=signature,
                             source=str(source), signature_material=material,
                             poisson_parameters=p_opts, sfm_clean_parameters=sfm_opts,
@@ -399,11 +444,14 @@ def prepare_scene(config):
                             quality=quality,
                             outputs={p.name: {'bytes': p.stat().st_size, 'mtime_ns': p.stat().st_mtime_ns}
                                      for p in (clean_path, mesh_path)})
-            _write_json_atomic(out_dir / 'module1_manifest.json', manifest)
+            _write_json_atomic(out_dir / 'metadata' / 'geometry_manifest.json', manifest)
     # Even on a cache hit, check that a changed FULL Gaussian still aligns with
     # SfM and reference mesh. This does not change the scientific R3 algorithm.
     quality = _check_geometry(clean_path, mesh_path, gaussian)
-    _write_json_atomic(out_dir / 'geometry_quality_report.json', quality)
+    model_key = hashlib.sha256(str(gaussian).encode('utf8')).hexdigest()[:10]
+    method = data.get('scene', {}).get('method', 'method')
+    quality_path = out_dir / 'metadata' / 'quality' / f'{method}__{model_key}.json'
+    _write_json_atomic(quality_path, quality)
     runtime = json.loads(json.dumps(data))
     runtime['paths']['clean_sfm_npz'] = str(clean_path)
     runtime['paths']['poisson_raw'] = str(mesh_path)
@@ -411,18 +459,16 @@ def prepare_scene(config):
     runtime['source_model_scope'] = 'full_reconstruction'
     runtime['module1'] = {**block, 'mode': 'prepared'}
     runtime['module1_runtime'] = {'status': 'completed', 'mode': 'auto',
-                                  'cached': cached, 'manifest': str(out_dir/'module1_manifest.json'),
-                                  'quality_report': str(out_dir/'geometry_quality_report.json'),
+                                  'cached': cached, 'manifest': str(out_dir/'metadata/geometry_manifest.json'),
+                                  'quality_report': str(quality_path),
                                   'clean_sfm': str(clean_path), 'poisson_raw': str(mesh_path),
                                   'warnings': quality['warnings']}
     # A new Gaussian method must never overwrite the effective YAML of a
     # different method that may still be running or undergoing evaluation.
-    model_key = hashlib.sha256(str(gaussian).encode('utf8')).hexdigest()[:10]
-    method = data.get('scene', {}).get('method', 'method')
-    effective = out_dir / f'active_scene__{method}__{model_key}.yaml'
+    effective = out_dir / 'runtime' / f'active_{method}__{model_key}.yaml'
     _write_yaml_atomic(effective, runtime)
     _status(out_dir, 'completed', '模块一已完成：已准备统一SfM/Poisson数据，进入ROI交互',
-            cached=cached, geometry_report=str(out_dir/'geometry_quality_report.json'),
+            cached=cached, geometry_report=str(quality_path),
             effective_config=str(effective))
     return effective
 
@@ -436,7 +482,7 @@ def main(argv=None):
     parser.add_argument('--gaussian-ply', help='Original FULL Gaussian model PLY')
     parser.add_argument('--colmap-images', help='Matching COLMAP images.bin (optional when already configured)')
     parser.add_argument('--sfm-dir', help='COLMAP sparse folder containing points3D.bin and images.bin')
-    parser.add_argument('--output-dir', help='Final ROI output ROOT for later interactive processing')
+    parser.add_argument('--output-dir', required=True, help='All GSSceneRefine outputs, including geometry and cache')
     args = parser.parse_args(argv)
     points, images = expand_colmap_inputs(args.sfm_dir, colmap_points=args.colmap_points,
                                           colmap_images=args.colmap_images)

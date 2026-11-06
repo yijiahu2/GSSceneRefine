@@ -63,7 +63,7 @@ def test_module2_preview_save_and_method_reuse(tmp_path):
     assert stats['gaussian_total']>0
     assert 0 < stats['gaussian_roi_count'] <= stats['gaussian_total']
     saved=save_confirmed_roi(obj,settings,stats)
-    assert saved['saved_path'].endswith('examplecliff_absgs_roi_001.json')
+    assert saved['saved_path'].endswith('roi_001.json')
     assert current_canonical(settings)==Path(saved['saved_path'])
     repeat=save_confirmed_roi(obj,settings,stats)
     assert repeat['saved_as_revision'] and repeat['saved_path'].endswith('_002.json')
@@ -77,12 +77,12 @@ def test_module2_preview_save_and_method_reuse(tmp_path):
     next_roi=annotate(other)
     again=save_confirmed_roi(next_roi,other)
     assert again['saved_as_revision']
-    assert again['saved_path'].endswith('examplecliff_edepth_roi_001.json')
+    assert again['saved_path'].endswith('roi_003.json')
     assert current_canonical(other)==Path(saved['saved_path'])
     assert len(read_manifest(settings.out_dir)['records'])==3
     next_roi['views'][0]['polygon'][0][0]+=0.1
     newer=save_confirmed_roi(next_roi,other)
-    assert newer['saved_path'].endswith('examplecliff_edepth_roi_002.json')
+    assert newer['saved_path'].endswith('roi_004.json')
 
 
 def test_module2_strict_frame_and_source(tmp_path):

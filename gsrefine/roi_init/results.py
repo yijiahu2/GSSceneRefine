@@ -67,9 +67,23 @@ def require_orientation(payload, settings, *, reuse_scene_geometry=False):
         if not reuse_scene_geometry:
             raise ValueError('ROI scene/method or source PLY does not match config; '
                              'use explicit --reuse-scene-roi for another method')
-        if settings.model_scope != 'full_reconstruction' or frame.get('source_model_scope') != 'full_reconstruction':
-            raise ValueError('Cross-method ROI reuse requires two complete, verified full-scene models; '
-                             'confirm a fresh full-scene ROI to upgrade legacy metadata')
+        if settings.model_scope != 'full_reconstruction':
+            raise ValueError('Cross-method ROI reuse requires a complete full-scene target Gaussian model')
+        scopes = {frame.get('source_model_scope'), frame.get('model_scope')} - {None, '', 'unknown'}
+        if 'aabb_baseline_only' in scopes or (scopes and 'full_reconstruction' not in scopes):
+            raise ValueError('Cross-method ROI reuse cannot accept cropped/AABB source models')
+        if 'full_reconstruction' not in scopes:
+            # Legacy annotations predate source_model_scope. The user must
+            # explicitly opt in with --reuse-scene-roi; the exact original
+            # Gaussian PLY and its recorded vertex count must still verify.
+            source = Path(frame.get('source_ply') or '')
+            if not source.is_file():
+                raise ValueError('Legacy ROI source PLY is missing: cannot verify cross-method reuse')
+            expected_count = frame.get('gaussian_count')
+            if expected_count is None or GaussianPLY(source).vertex_count != int(expected_count):
+                raise ValueError('Legacy ROI source Gaussian count mismatch: cannot verify reuse')
+            print('[roi-init] Legacy ROI scope inferred from verified source PLY and explicit --reuse-scene-roi; '
+                  'verify it was the complete reconstruction.', flush=True)
     views=view_record_validate(payload)
     top=next(v for v in views.views if v.name=='top')
     if not np.allclose(np.cross(top.U[0],top.U[1]),expected,rtol=0.,atol=1e-6):
@@ -226,7 +240,7 @@ def save_confirmed_roi(payload, settings, preview=None, *, new_revision=False):
         # the scene's first canonical reference are never silently overwritten.
         existing={r['filename'] for r in m['records']}
         for num in range(1,10000):
-            filename=f'{settings.scene}_{settings.method}_roi_{num:03d}.json'
+            filename=f'roi_{num:03d}.json'
             if filename not in existing and not (out/filename).exists():break
         else:raise RuntimeError('More than 9999 ROI records for scene/method')
         saved=datetime.now(timezone.utc).isoformat()

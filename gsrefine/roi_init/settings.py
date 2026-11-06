@@ -66,12 +66,14 @@ class InitSettings:
             raise ValueError('roi_init.orientation.frame_id must name the shared original COLMAP world frame for this scene')
         # Auto mode estimates an ARBITRARY vector in original SfM coordinates.
         # Old +z/verified options cannot override this result.
-        estimate=read_or_estimate(scene,str(frame_id),orientation,data,
-                                 PROJECT_ROOT/'runs'/'orientation')
+        cache_dir = Path(orientation.get('cache_dir', out.parent / 'geometry' / 'orientation'))
+        if not cache_dir.is_absolute():
+            cache_dir = out.parent / cache_dir
+        estimate=read_or_estimate(scene,str(frame_id),orientation,data,cache_dir)
         if not estimate.get('accepted'):
             raise ValueError('Automatic COLMAP vertical direction is uncertain: '
                              + '; '.join(estimate.get('warnings',[]))
-                             + '. See runs/orientation for diagnostics. '
+                             + f'. See {cache_dir} for diagnostics. '
                              + 'Do not force +Z; inspect GNSS/IMU or use an explicitly verified manual vector.')
         up=np.asarray(estimate['up_vector'],float)
         if up.shape!=(3,) or not np.isfinite(up).all() or abs(np.linalg.norm(up)-1)>1e-6:

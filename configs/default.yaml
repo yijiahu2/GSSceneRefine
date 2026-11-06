@@ -1,0 +1,79 @@
+# GSSceneRefine general-purpose configuration (Modules 1-4).
+# The scene, method, COLMAP inputs, full Gaussian PLY and all output paths
+# MUST be provided by the CLI. Never put scene-specific paths in this file.
+# Existing algorithm settings are retained as the initial cross-scene baseline;
+# they are not guaranteed to be optimal for every landscape.
+paths: {}
+
+# Valid placeholders required by the current config reader; CLI overrides both.
+scene:
+  name: template
+  method: template
+
+source_model_scope: full_reconstruction
+
+# Module 1 uses original COLMAP SfM to construct reusable geometry per scene.
+module1:
+  mode: auto
+  sfm_clean:
+    min_track: 3
+    error_mad_mult: 5.0
+    sor_neighbors: 16
+    sor_std: 2.5
+    do_sor: true
+  poisson:
+    depth: 9
+    normal_k: 30
+    orientation_k: 30
+    radius_scale: 4.0
+    scale: 1.1
+    density_quantile: 0.0
+
+# Existing ROI-study parameters; unchanged when switching scene templates.
+sfm:
+  knn_spacing: 6
+  confidence_weights: [0.35, 0.40, 0.25]
+  confidence_threshold: 0.75
+  local_fit_enabled: true
+  fit_knn: 16
+  fit_batch_size: 50000
+
+guards:
+  seed: 2026
+  inner_band_frac: 0.03
+  outside_search_frac: 0.025
+  geodesic_limit_frac: 0.04
+  max_extension_area_fraction: 0.10
+  max_guard_add_fraction: 0.12
+  max_surface_samples: 15000
+  local_radius_multiplier: 4.0
+  local_radius_min_frac: 0.002
+  local_radius_max_frac: 0.02
+  max_gaussian_neighbors: 64
+  min_gaussian_neighbors: 16
+  global_sample_cap: 6000
+  sigma_multiplier: 3.0
+  sfm_uncertainty_factor: 0.50
+  b_min_frac: 0.0005
+  b_max_frac: 0.012
+
+roi_init:
+  orientation:
+    mode: auto
+  reuse_scene_roi: true
+  allow_new_revision: false
+  file_service:
+    platform: windows
+    host: 127.0.0.1
+    port: 8766
+  web:
+    host: 127.0.0.1
+    port: 8765
+  views:
+    elevation_candidates: 8
+    elevation_interval_deg: 45
+    max_elevation_views: 4
+
+workflow:
+  auto_after_confirm: true
+  final_method: R3

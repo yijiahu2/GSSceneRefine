@@ -49,16 +49,16 @@ def test_latest_is_scene_wide_not_highest_method_number(tmp_path):
         a = annotate(settings)
         a['views'][0]['polygon'][0][0] += i * 0.01
         first = save_confirmed_roi(a, settings)
-    assert first['saved_path'].endswith('absgs_roi_003.json')
+    assert first['saved_path'].endswith('roi_003.json')
 
     cfg = yaml.safe_load(config.read_text())
     cfg['scene']['method'] = 'edepth'
     config.write_text(yaml.safe_dump(cfg))
     other = InitSettings.load(config)
     saved = save_confirmed_roi(annotate(other), other)
-    assert saved['saved_path'].endswith('edepth_roi_001.json')
+    assert saved['saved_path'].endswith('roi_004.json')
     assert current_latest(other) == Path(saved['saved_path'])
-    assert current_canonical(other).name.endswith('absgs_roi_001.json')
+    assert current_canonical(other).name.endswith('roi_001.json')
     assert read_manifest(other.out_dir)['scene_latest'][other.scene] == Path(saved['saved_path']).name
     assert refine_main(['--config', str(config), '--show-roi']) == Path(saved['saved_path'])
 

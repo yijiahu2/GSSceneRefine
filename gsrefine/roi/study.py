@@ -369,7 +369,8 @@ def analyze(mesh, roi, conf, threshold, diag, guard_cfg, up, *,
 
 def run(config,roi_file,output_dir, labels_file=None, *, export_ply=False,
         run_ablation=True, up_vector=None, gaussian_path=None,
-        export_final=True, final_method='R3', final_only=False, progress_callback=None):
+        export_final=True, final_method='R3', final_only=False, progress_callback=None,
+        save_diagnostics=True, save_indices=True):
     if final_only and (not run_ablation or final_method != 'R3' or export_ply):
         raise ValueError('final_only requires R3, run_ablation, and no comparison PLY exports')
     config=Path(config).resolve();cfg=yaml.safe_load(config.read_text(encoding='utf8'))
@@ -437,46 +438,47 @@ def run(config,roi_file,output_dir, labels_file=None, *, export_ply=False,
                      scales_count=int(cfg.get('roi_study',{}).get('growth_steps',6)))
     base=roi.distances(xyz);basemask=np.all(base>=-1e-9,axis=1)
     np.save(out/'keep_mask_R0.npy',basemask)
-    np.savez_compressed(out/'boundary_traces.npz',xyz=analysis['traces'].astype('f4'),
-                         view_edge=analysis['trace_labels'])
-    np.savez_compressed(out/'full_exterior_faces.npz',
-                        raw_exterior_face_indices=np.flatnonzero(analysis['full_raw_mask']).astype('i4'),
-                        credible_exterior_face_indices=np.flatnonzero(analysis['full_credible_mask']).astype('i4'),
-                        credible_exterior_confidence=conf[analysis['full_credible_mask']].astype('f4'))
-    np.savez_compressed(out/'candidate_faces.npz',face_indices=np.flatnonzero(analysis['candidate']).astype('i4'),
-                         group_indices=analysis['group_ids'][analysis['candidate']].astype('i4'),
-                         confidence=conf[analysis['candidate']].astype('f4'))
-    _write_csv(out/'candidate_groups.csv',[{k:(json.dumps(v) if isinstance(v,(list,dict)) else v)
-                   for k,v in row.items()} for row in analysis['groups']])
-    json_write(out/'candidate_groups.json',analysis['groups'])
-    json_write(out/'full_exterior_components.json',analysis['full_component_diagnostics'])
-    json_write(out/'background_components.json',analysis['component_diagnostics'])
-    _write_csv(out/'background_components.csv',[
-        {k:(json.dumps(v) if isinstance(v,(list,dict)) else v) for k,v in row.items()}
-        for row in analysis['component_diagnostics']])
-    # Diagnostic exports: complete ROI exterior before confidence cutoff (raw)
-    # and after confidence cutoff (trusted). Neither is a Gaussian recovery mask.
-    _write_faces(mesh,analysis['full_raw_mask'],out/'exterior_raw_full.ply',[180,180,180,255])
-    _write_faces(mesh,analysis['full_credible_mask'],out/'exterior_credible_full.ply',[53,175,202,255])
-    _write_faces(mesh,analysis['candidate'],out/'exterior_candidate_local.ply',[230,158,30,255])
-    palette={'normal':[140,140,140,255],'suspect':[255,68,47,255],
-             'uncertain':[255,167,35,255]}
-    for label,color in palette.items():
-        _write_faces(mesh,analysis['label_masks'][label],out/f'exterior_{label}.ply',color)
-    if np.any(analysis['candidate']):
-        merged=trimesh.Trimesh(vertices=np.asarray(mesh.vertices),
-              faces=np.asarray(mesh.faces)[analysis['candidate']],process=False)
-        group_indices=analysis['group_ids'][analysis['candidate']]
-        merged.visual.face_colors=np.array([palette[analysis['groups'][int(i)]['effective_label']]
-                if i>=0 else palette['uncertain'] for i in group_indices],dtype=np.uint8)
-        merged.remove_unreferenced_vertices()
-        merged.export(out/'exterior_all_colored.ply')
-    else:
-        (out/'exterior_all_colored.ply').unlink(missing_ok=True)
-    if len(analysis['traces']):
-        cloud=trimesh.points.PointCloud(analysis['traces'],colors=[15,212,240,255]);cloud.export(out/'roi_boundary_trace.ply')
-    else:
-        (out/'NO_BOUNDARY_TRACE.txt').write_text('No trace samples: inspect ROI coordinate system and mesh coverage.\n')
+    if save_diagnostics:
+        np.savez_compressed(out/'boundary_traces.npz',xyz=analysis['traces'].astype('f4'),
+                             view_edge=analysis['trace_labels'])
+        np.savez_compressed(out/'full_exterior_faces.npz',
+                            raw_exterior_face_indices=np.flatnonzero(analysis['full_raw_mask']).astype('i4'),
+                            credible_exterior_face_indices=np.flatnonzero(analysis['full_credible_mask']).astype('i4'),
+                            credible_exterior_confidence=conf[analysis['full_credible_mask']].astype('f4'))
+        np.savez_compressed(out/'candidate_faces.npz',face_indices=np.flatnonzero(analysis['candidate']).astype('i4'),
+                             group_indices=analysis['group_ids'][analysis['candidate']].astype('i4'),
+                             confidence=conf[analysis['candidate']].astype('f4'))
+        _write_csv(out/'candidate_groups.csv',[{k:(json.dumps(v) if isinstance(v,(list,dict)) else v)
+                       for k,v in row.items()} for row in analysis['groups']])
+        json_write(out/'candidate_groups.json',analysis['groups'])
+        json_write(out/'full_exterior_components.json',analysis['full_component_diagnostics'])
+        json_write(out/'background_components.json',analysis['component_diagnostics'])
+        _write_csv(out/'background_components.csv',[
+            {k:(json.dumps(v) if isinstance(v,(list,dict)) else v) for k,v in row.items()}
+            for row in analysis['component_diagnostics']])
+        # Diagnostic exports: complete ROI exterior before confidence cutoff (raw)
+        # and after confidence cutoff (trusted). Neither is a Gaussian recovery mask.
+        _write_faces(mesh,analysis['full_raw_mask'],out/'exterior_raw_full.ply',[180,180,180,255])
+        _write_faces(mesh,analysis['full_credible_mask'],out/'exterior_credible_full.ply',[53,175,202,255])
+        _write_faces(mesh,analysis['candidate'],out/'exterior_candidate_local.ply',[230,158,30,255])
+        palette={'normal':[140,140,140,255],'suspect':[255,68,47,255],
+                 'uncertain':[255,167,35,255]}
+        for label,color in palette.items():
+            _write_faces(mesh,analysis['label_masks'][label],out/f'exterior_{label}.ply',color)
+        if np.any(analysis['candidate']):
+            merged=trimesh.Trimesh(vertices=np.asarray(mesh.vertices),
+                  faces=np.asarray(mesh.faces)[analysis['candidate']],process=False)
+            group_indices=analysis['group_ids'][analysis['candidate']]
+            merged.visual.face_colors=np.array([palette[analysis['groups'][int(i)]['effective_label']]
+                    if i>=0 else palette['uncertain'] for i in group_indices],dtype=np.uint8)
+            merged.remove_unreferenced_vertices()
+            merged.export(out/'exterior_all_colored.ply')
+        else:
+            (out/'exterior_all_colored.ply').unlink(missing_ok=True)
+        if len(analysis['traces']):
+            cloud=trimesh.points.PointCloud(analysis['traces'],colors=[15,212,240,255]);cloud.export(out/'roi_boundary_trace.ply')
+        else:
+            (out/'NO_BOUNDARY_TRACE.txt').write_text('No trace samples: inspect ROI coordinate system and mesh coverage.\n')
     report={'schema':'GSSceneRefine.roi_study.v1','roi':str(Path(roi_file).resolve()),
       'input_sha256':{'roi':file_sha256(roi_file),'poisson':file_sha256(meshfile),
         'sfm':file_sha256(sfmfile),'gaussian':file_sha256(plyfile)},
@@ -512,11 +514,12 @@ def run(config,roi_file,output_dir, labels_file=None, *, export_ply=False,
                                 float(cfg['guards']['outside_search_frac'])) * diag
                 recovery_faces, anchored_info = anchored_local_recovery_faces(
                     mesh, roi, exterior, analysis['inside'], geo_limit)
-                _write_faces(mesh, recovery_faces, out/'exterior_r3_recovery_eligible.ply',
-                             [35, 188, 88, 255])
-                _write_faces(mesh, exterior & ~recovery_faces,
-                             out/'exterior_r3_recovery_rejected.ply',
-                             [228, 101, 55, 255])
+                if save_diagnostics:
+                    _write_faces(mesh, recovery_faces, out/'exterior_r3_recovery_eligible.ply',
+                                 [35, 188, 88, 255])
+                    _write_faces(mesh, exterior & ~recovery_faces,
+                                 out/'exterior_r3_recovery_rejected.ply',
+                                 [228, 101, 55, 255])
                 if progress_callback: progress_callback('core', '恢复有限连通Poisson曲面支持的局部主体')
                 core, extra, kept, two_stage_info = recover_two_stage_from_poisson(
                     roi=roi, mesh=mesh, selected_faces=recovery_faces,
@@ -586,7 +589,8 @@ def run(config,roi_file,output_dir, labels_file=None, *, export_ply=False,
         if progress_callback: progress_callback('exporting', '写入最终Gaussian R3 PLY并校验属性')
         from .finalize import finalize
         result=finalize(out,method=final_method,gaussian_path=plyfile,
-                        report=report,source_ply=ply,verify_input_hash=False)
+                        report=report,source_ply=ply,verify_input_hash=False,
+                        save_indices=save_indices)
         report['final_gaussian_scene']=result
         json_write(out/'study_report.json',report)
     elif not run_ablation:

@@ -22,7 +22,8 @@ def test_reuse_confirmed_full_scene_roi_in_another_method_without_overwriting(tm
     original = Path(save_confirmed_roi(annotate(first), first)['saved_path'])
     first_output = output_for_roi(config, original)
     first_output.mkdir(parents=True, exist_ok=True)
-    preserved = first_output / 'gaussians_final_R3.ply'
+    preserved = first_output / 'final' / 'gaussian_roi.ply'
+    preserved.parent.mkdir(parents=True, exist_ok=True)
     preserved.write_bytes(b'original-method-model')
     new_model = tmp_path / 'method_vanilla.ply'
     new_model.write_bytes(first.gaussian_ply.read_bytes())
@@ -38,8 +39,9 @@ def test_reuse_confirmed_full_scene_roi_in_another_method_without_overwriting(tm
     assert require_orientation(payload, second, reuse_scene_geometry=True)
     second_output = output_for_roi(config, original)
     assert second_output != first_output
-    assert second_output.parent == first_output.parent
-    assert 'vanilla' in second_output.name
+    assert second_output.parent != first_output.parent
+    assert second_output.parent.parent == first_output.parent.parent
+    assert 'vanilla' in str(second_output.parent)
     seen = []
     def fake_study(cfg, roi, out, **kwargs):
         seen.append((Path(cfg), Path(roi), Path(out), kwargs))
@@ -52,12 +54,13 @@ def test_reuse_confirmed_full_scene_roi_in_another_method_without_overwriting(tm
                     'final_gaussians': 7, 'added_gaussians': 2}}
     monkeypatch.setattr('gsrefine.roi.study.run', fake_study)
     result = run_once(config, original, reuse_scene_roi=True)
-    assert len(seen) == 1 and seen[0][2] == second_output
+    assert len(seen) == 1 and seen[0][2].parent == second_output
     assert result['target_method'] == 'vanilla'
     assert result['reused_roi_geometry'] is True
     assert preserved.read_bytes() == b'original-method-model'
     assert Path(result['final_ply']).read_bytes() == b'other-method-model'
-    assert 'save_diagnostics' not in seen[0][3]  # original output behavior preserved
+    assert seen[0][3]['save_diagnostics'] is False
+    assert seen[0][3]['save_indices'] is False
 
 
 def test_roi_not_reusable_in_other_scene_or_aabb(tmp_path):

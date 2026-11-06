@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import traceback
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,8 @@ import yaml
 
 from gsrefine.roi_init.settings import PROJECT_ROOT, InitSettings
 from gsrefine.roi_init.results import current_latest_for_source, require_orientation, write_atomic
+from gsrefine.roi_init.output_layout import (run_dir, publish, result_path, progress_path,
+                                            log_path, FINAL_REL, MANIFEST_REL)
 
 PROGRESS_FILENAME = 'workflow_progress.json'
 PHASES = {
@@ -58,34 +61,22 @@ def workflow_options(config):
     opts = data.get('workflow', {}) or {}
     if not isinstance(opts, dict):
         raise ValueError('workflow must be a YAML mapping')
-    out = Path(opts.get('output_root', 'runs/roi_tests')).expanduser()
+    out = Path(opts.get('output_root', path.parent / 'gsrefine_results')).expanduser()
     if not out.is_absolute():
-        out = PROJECT_ROOT / out
+        out = path.parent / out
     if opts.get('final_method', 'R3') != 'R3':
         raise ValueError('Automatic pipeline final_method must be R3')
     return {'enabled': bool(opts.get('auto_after_confirm', False)),
             'output_root': out.resolve(), 'final_method': 'R3'}
 
 
-def output_for_roi(config, roi):
-    """One stable experiment directory for each numbered confirmed ROI."""
-    p = Path(roi).expanduser().resolve(strict=True)
-    if not p.name.endswith('.json') or not p.stem:
-        raise ValueError('A confirmed ROI must be a JSON artifact')
-    root = workflow_options(config)['output_root']
-    meta = json.loads(p.read_text(encoding='utf8')).get('annotation_metadata', {})
+def output_for_roi(config, roi, output_root=None):
+    """Public run directory: <root>/<scene>/methods/<method>/roi_NNN/."""
+    roi = Path(roi).expanduser().resolve(strict=True)
     cfg = yaml.safe_load(Path(config).read_text(encoding='utf8'))
     scene = cfg.get('scene', {}) or {}
-    current = Path(cfg.get('paths', {}).get('gaussian_ply', '')).expanduser().resolve()
-    if meta.get('source_ply') == str(current) and meta.get('method') == scene.get('method'):
-        return root / p.stem  # Existing ROI005 path is backwards compatible.
-    method = scene.get('method', 'unknown')
-    st = current.stat()
-    # Include file identity to avoid overwriting another model stored later
-    # at the same pathname. Keep the original matching-source output path.
-    identity = f'{current}|{st.st_size}|{st.st_mtime_ns}'
-    source_key = hashlib.sha256(identity.encode('utf8')).hexdigest()[:8]
-    return root / f'{p.stem}__{method}__{source_key}'
+    root = Path(output_root).expanduser().resolve() if output_root else workflow_options(config)['output_root']
+    return run_dir(root, scene['name'], scene['method'], roi)
 
 
 def update_progress(out, phase, *, detail='', roi=None, **extra):
@@ -93,7 +84,8 @@ def update_progress(out, phase, *, detail='', roi=None, **extra):
     if phase not in PHASES:
         raise ValueError(f'Unknown workflow phase: {phase}')
     out = Path(out)
-    progress = out / PROGRESS_FILENAME
+    progress = progress_path(out)
+    progress.parent.mkdir(parents=True, exist_ok=True)
     try:
         old = json.loads(progress.read_text(encoding='utf8'))
     except (OSError, json.JSONDecodeError, ValueError):
@@ -123,20 +115,24 @@ def update_progress(out, phase, *, detail='', roi=None, **extra):
 
 def _read_progress(out):
     try:
-        data = json.loads((Path(out) / PROGRESS_FILENAME).read_text(encoding='utf8'))
+        data = json.loads(progress_path(out).read_text(encoding='utf8'))
         return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError, ValueError):
         return {}
 
 
 def _checked_result(out, roi, sha):
-    """Only a matching manifest AND a real nonempty PLY authorize completion."""
-    data = json.loads((out / 'workflow_result.json').read_text(encoding='utf8'))
+    """A valid manifest, source identity and nonempty model authorize success."""
+    out = Path(out)
+    data = json.loads(result_path(out).read_text(encoding='utf8'))
+    manifest = json.loads((out / MANIFEST_REL).read_text(encoding='utf8'))
     path = Path(data['final_ply']).resolve(strict=True)
     if (data['roi_sha256'] != sha or Path(data['roi']).resolve() != roi or
-            not path.is_file() or not path.stat().st_size > 0 or
-            path != (out / 'gaussians_final_R3.ply').resolve()):
-        raise ValueError('Final model/ROI verification failed')
+            not path.is_file() or path.stat().st_size <= 0 or
+            path != (out / FINAL_REL).resolve() or
+            manifest.get('status') != 'completed' or
+            Path(manifest['stage2_inputs']['gaussian_ply']).resolve() != path):
+        raise ValueError('Final model/ROI manifest verification failed')
     return {'final_ply': str(path), 'R0_gaussians': data['R0_gaussians'],
             'final_gaussians': data['final_gaussians'],
             'added_gaussians': data['added_gaussians'],
@@ -157,19 +153,23 @@ def _pid_alive(pid):
         return False
 
 
-def run_once(config, roi, output_dir=None, *, reuse_scene_roi=False):
-    """Synchronous reproducible pipeline; interactive and direct CLI share it."""
-    # Calling roi-auto directly with the original scene YAML must prepare the
-    # same geometry as interactive roi-init; subprocesses passed the effective
-    # config are a no-op (module1.mode=prepared).
+def run_once(config, roi, output_dir=None, *, reuse_scene_roi=False,
+             keep_diagnostics=False):
+    """Four-module sync workflow; --output-dir always means the output ROOT.
+
+    Module-3's validated algorithm writes into a temporary, isolated study
+    directory. Only final outputs and requested diagnostics are published.
+    """
     from gsrefine.geometry.prepare import prepare_scene
     config = prepare_scene(config)
     roi = Path(roi).expanduser().resolve(strict=True)
-    output_dir = Path(output_dir).expanduser().resolve() if output_dir else output_for_roi(config, roi)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    result_file = output_dir / 'workflow_result.json'
-    result_file.unlink(missing_ok=True)
-    update_progress(output_dir, 'validating', roi=roi, pid=os.getpid(),
+    out = output_for_roi(config, roi, output_root=output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    completed = out / FINAL_REL
+    if completed.exists() or result_path(out).is_file():
+        raise FileExistsError(f'Existing ROI result will not be overwritten: {out}. '
+                              'Choose another ROI or remove this specific run after backup.')
+    update_progress(out, 'validating', roi=roi, pid=os.getpid(),
                     detail='检查已确认ROI、Gaussian PLY和COLMAP坐标一致性')
     settings = InitSettings.load(config)
     require_orientation(json.loads(roi.read_text(encoding='utf8')), settings,
@@ -177,57 +177,69 @@ def run_once(config, roi, output_dir=None, *, reuse_scene_roi=False):
     scene_config = yaml.safe_load(config.read_text(encoding='utf8'))
     study_source = Path(scene_config['paths']['gaussian_ply']).expanduser().resolve()
     if study_source != settings.gaussian_ply:
-        raise ValueError('Module 1 display Gaussian and Module 3 study Gaussian differ; configure one common source PLY')
-    update_progress(output_dir, 'loading', detail='读取原始PLY和Poisson曲面')
+        raise ValueError('Module 2 display Gaussian and Module 3 study Gaussian differ')
+    update_progress(out, 'loading', detail='读取原始Gaussian和可信Poisson曲面')
 
     def report_stage(phase, detail=''):
-        update_progress(output_dir, phase, detail=detail)
+        update_progress(out, phase, detail=detail)
 
     from gsrefine.roi.study import run as run_study
-    report = run_study(config, roi, output_dir, run_ablation=True, final_only=True,
-                       export_final=True, final_method='R3', progress_callback=report_stage)
-    update_progress(output_dir, 'verifying', detail='检查最终PLY、ROI身份和两阶段Gaussian数量')
-    final = report.get('final_gaussian_scene') or {}
-    ply = Path(final.get('output_ply', ''))
-    if not ply.is_file() or final.get('method') != 'R3':
-        raise RuntimeError('Module 4 did not produce a validated final R3 PLY')
-    if Path(report['roi']).resolve() != roi or report['input_sha256']['roi'] != _sha(roi):
-        raise RuntimeError('Final study ROI does not match the confirmed annotation')
-    r3 = next((x for x in report.get('ablation', []) if x.get('method') == 'R3'), None)
-    stages = r3.get('two_stage_diagnostics', {}) if r3 else {}
-    recovered = stages.get('stage_A', {}).get('restored_core_gaussians')
-    safety = stages.get('stage_B', {}).get('safety_added_gaussians')
-    if recovered is not None and safety is not None:
-        if int(recovered) + int(safety) != int(final['added_gaussians']):
-            raise RuntimeError('R3 two-stage counts do not sum to the final added Gaussian count')
+    # TemporaryDirectory cleans even on Python exceptions. For SIGKILL,
+    # stale work directories are removable by the next managed invocation.
+    import shutil
+    for stale in out.glob('.work-*'):
+        if stale.is_dir():
+            shutil.rmtree(stale)
+    with tempfile.TemporaryDirectory(prefix='.work-', dir=out) as scratch:
+        work = Path(scratch)
+        report = run_study(config, roi, work, run_ablation=True, final_only=True,
+                           export_final=True, final_method='R3', progress_callback=report_stage,
+                           save_diagnostics=keep_diagnostics, save_indices=keep_diagnostics)
+        update_progress(out, 'verifying', detail='检查PLY、ROI身份和恢复数量')
+        final = report.get('final_gaussian_scene') or {}
+        ply = Path(final.get('output_ply', ''))
+        if not ply.is_file() or final.get('method') != 'R3':
+            raise RuntimeError('Module 4 did not produce a validated Gaussian ROI PLY')
+        if Path(report['roi']).resolve() != roi or report['input_sha256']['roi'] != _sha(roi):
+            raise RuntimeError('Final study ROI does not match confirmed annotation')
+        r3 = next((x for x in report.get('ablation', []) if x.get('method') == 'R3'), None)
+        stages = r3.get('two_stage_diagnostics', {}) if r3 else {}
+        recovered = stages.get('stage_A', {}).get('restored_core_gaussians')
+        safety = stages.get('stage_B', {}).get('safety_added_gaussians')
+        if recovered is not None and safety is not None:
+            if int(recovered) + int(safety) != int(final['added_gaussians']):
+                raise RuntimeError('R3 recovery counts do not sum to final added count')
+        model, manifest, summary = publish(out, work, roi, config, report,
+                                           keep_diagnostics=keep_diagnostics)
     result = {
-        'schema': 'GSSceneRefine.workflow.v1', 'status': 'completed',
+        'schema': 'GSSceneRefine.workflow.v2', 'status': 'completed',
         'source_scene': settings.scene, 'target_method': settings.method,
         'source_gaussian': str(settings.gaussian_ply),
         'reused_roi_geometry': bool(reuse_scene_roi),
         'completed_utc': _utc(), 'roi': str(roi), 'roi_sha256': _sha(roi),
-        'output_dir': str(output_dir), 'final_ply': str(ply),
+        'output_dir': str(out), 'final_ply': str(model),
         'R0_gaussians': int(report['R0_count']),
         'final_gaussians': int(final['final_gaussians']),
         'added_gaussians': int(final['added_gaussians']),
         'core_restored_gaussians': int(recovered) if recovered is not None else None,
         'safety_added_gaussians': int(safety) if safety is not None else None,
-        'study_report': str(output_dir / 'study_report.json'),
-        'final_report': str(output_dir / 'final_gaussian_report_R3.json'),
+        'processing_report': str(out/'metadata/processing_report.json'),
+        'manifest': str(out/MANIFEST_REL),
     }
-    write_atomic(result_file, result)
-    update_progress(output_dir, 'completed', detail='最终PLY已导出且通过一致性检查')
+    write_atomic(result_path(out), result)
+    update_progress(out, 'completed', detail='Gaussian ROI已导出且通过一致性检查')
     print(f'[roi-auto] Complete: {result["final_ply"]}', flush=True)
     return result
 
 
 class WorkflowManager:
     """Thread-safe handoff; durable status survives tab/browser/server restarts."""
-    def __init__(self, config, settings=None):
+    def __init__(self, config, settings=None, *, keep_diagnostics=False):
         self.config = Path(config).expanduser().resolve(strict=True) if config else None
         self.options = workflow_options(self.config) if self.config else {'enabled': False}
         self.enabled = self.options['enabled']
         self.settings = settings
+        self.keep_diagnostics = bool(keep_diagnostics)
         self.confirm_lock = threading.Lock()
         self._lock = threading.Lock()
         self._job = None
@@ -242,10 +254,10 @@ class WorkflowManager:
             if roi is None:
                 return None
             out = output_for_roi(self.config, roi)
-            if not (out / PROGRESS_FILENAME).is_file() and not (out / 'workflow_result.json').is_file():
+            if not progress_path(out).is_file() and not result_path(out).is_file():
                 return None
             return {'roi': roi, 'roi_sha256': _sha(roi), 'output_dir': out,
-                    'log': out / 'workflow.log', 'process': None, 'started_utc': None}
+                    'log': log_path(out), 'process': None, 'started_utc': None}
         except (ValueError, OSError, KeyError, RuntimeError):
             return None
 
@@ -260,7 +272,7 @@ class WorkflowManager:
         if progress.get('roi_sha256') != recent['roi_sha256']:
             return False
         return (progress.get('status') == 'running' and _pid_alive(progress.get('pid'))
-                and not (recent['output_dir'] / 'workflow_result.json').is_file())
+                and not result_path(recent['output_dir']).is_file())
 
     def launch(self, roi):
         if not self.enabled:
@@ -271,13 +283,17 @@ class WorkflowManager:
             if self._job and self._job['process'].poll() is None:
                 raise RuntimeError('Another ROI is already being processed')
             out.mkdir(parents=True, exist_ok=True)
-            # A new run must never inherit a previous success marker.
-            (out / 'workflow_result.json').unlink(missing_ok=True)
+            # Never destroy a completed model or success marker.
+            if (out / FINAL_REL).exists() or result_path(out).is_file():
+                raise FileExistsError(f'ROI result already exists: {out}')
             update_progress(out, 'queued', roi=roi, detail='已接受ROI确认，正在创建本地计算进程', pid=None)
-            log = out / 'workflow.log'
+            log = log_path(out)
+            log.parent.mkdir(parents=True, exist_ok=True)
             command = [sys.executable, str(PROJECT_ROOT / 'run.py'), 'roi-auto',
                        '--config', str(self.config), '--roi', str(roi),
-                       '--output-dir', str(out)]
+                       '--output-dir', str(self.options['output_root'])]
+            if self.keep_diagnostics:
+                command.append('--keep-diagnostics')
             with log.open('w', encoding='utf8') as stream:
                 process = subprocess.Popen(command, cwd=PROJECT_ROOT,
                                            stdin=subprocess.DEVNULL,
@@ -401,7 +417,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='Modules 3+4 for an already confirmed Module-2 ROI')
     parser.add_argument('--config', required=True)
     parser.add_argument('--roi', required=True, help='Confirmed ROI JSON (never an unsaved draft)')
-    parser.add_argument('--output-dir', default=None)
+    parser.add_argument('--output-dir', required=True, help='Root containing all scene-level and method-level results')
+    parser.add_argument('--keep-diagnostics', action='store_true', help='Keep detailed research masks, PLYs and tables')
     parser.add_argument('--reuse-scene-roi', action='store_true',
                         help='Explicitly apply a full-scene ROI to another Gaussian model in the identical COLMAP frame')
     parser.add_argument('--scene', help='Scene ID for a new COLMAP reconstruction')
@@ -411,21 +428,46 @@ def main(argv=None):
     parser.add_argument('--colmap-images', help='COLMAP images.bin defining the same camera/world frame')
     parser.add_argument('--sfm-dir', help='COLMAP sparse directory containing points3D.bin and images.bin')
     args = parser.parse_args(argv)
-    config = args.config
-    if any((args.scene, args.method, args.gaussian_ply, args.colmap_points,
-            args.colmap_images, args.sfm_dir)):
+    config = Path(args.config).expanduser().resolve(strict=True)
+    root = Path(args.output_dir).expanduser().resolve()
+    overrides = any((args.scene, args.method, args.gaussian_ply,
+                     args.colmap_points, args.colmap_images, args.sfm_dir))
+    # A prepared config produced by roi-init already points exclusively into
+    # this root. Reusing it prevents an unnecessary Module-1 rerun in the worker.
+    config_data = yaml.safe_load(config.read_text(encoding='utf8')) or {}
+    stored_root = (config_data.get('workflow', {}) or {}).get('output_root')
+    try:
+        managed_config = (
+            config_data.get('module1', {}).get('mode') == 'prepared'
+            and config.is_relative_to(root)
+            and bool(stored_root)
+            and Path(stored_root).expanduser().resolve() == root
+            and Path(config_data['roi_init']['output_dir']).expanduser().resolve().is_relative_to(root)
+            and Path(config_data['module1_runtime']['clean_sfm']).expanduser().resolve().is_relative_to(root)
+            and Path(config_data['module1_runtime']['poisson_raw']).expanduser().resolve().is_relative_to(root)
+        )
+    except (TypeError, ValueError, KeyError, AttributeError):
+        managed_config = False
+    if overrides or not managed_config:
+        # Even --output-dir alone must redirect geometry/orientation/ROI. An
+        # old configs/*.yaml may still refer to in-repository runs/ paths.
         from gsrefine.geometry.prepare import prepare_input_config, expand_colmap_inputs
         points, images = expand_colmap_inputs(args.sfm_dir, colmap_points=args.colmap_points,
                                               colmap_images=args.colmap_images)
-        config = prepare_input_config(config, scene=args.scene, method=args.method,
-                                      gaussian_ply=args.gaussian_ply, colmap_points=points,
-                                      colmap_images=images)
+        if not overrides and not (config_data.get('module1', {}) or {}).get('colmap_points') and not (
+                config_data.get('paths', {}) or {}).get('colmap_points'):
+            from gsrefine.geometry.prepare import relocate_existing_reference_config
+            config = relocate_existing_reference_config(config, root)
+        else:
+            config = prepare_input_config(config, scene=args.scene, method=args.method,
+                                          gaussian_ply=args.gaussian_ply, colmap_points=points,
+                                          colmap_images=images, final_output_root=root)
     try:
-        run_once(config, args.roi, args.output_dir, reuse_scene_roi=args.reuse_scene_roi)
+        run_once(config, args.roi, args.output_dir, reuse_scene_roi=args.reuse_scene_roi,
+                 keep_diagnostics=args.keep_diagnostics)
     except Exception as exc:
         try:
-            output_dir = (Path(args.output_dir).expanduser().resolve() if args.output_dir
-                          else output_for_roi(config, args.roi))
+            output_dir = output_for_roi(config, args.roi, args.output_dir)
             update_progress(output_dir, 'failed', detail=str(exc))
         except (OSError, ValueError):
             pass
