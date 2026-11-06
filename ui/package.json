@@ -1,0 +1,14 @@
+{
+  "name": "gsscenerefine-roi-workspace",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "PlayCanvas-based dual orthographic Gaussian ROI annotation workspaces",
+  "dependencies": {
+    "playcanvas": "2.23.3",
+    "@playcanvas/splat-transform": "3.10.3"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  }
+}

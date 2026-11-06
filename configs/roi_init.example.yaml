@@ -1,0 +1,24 @@
+# MODULE 2 example. Do not directly overwrite an existing scene YAML.
+# Use: python tools/activate_roi_init.py --config configs/songziguanyin.yaml --scene songziguanyin --method absgs
+roi_init:
+  # By default source PLY and Poisson mesh come from the existing paths section.
+  output_dir: /home/xth/GSSceneRefine/runs/roi_init
+  orientation:
+    mode: auto
+    frame_id: songziguanyin_colmap_original
+    # Use the ORIGINAL registered COLMAP camera poses, same world frame as Gaussian PLY.
+    colmap_images: /home/xth/datasets/danxiashan/songziguanyin/sparse/images.bin
+    # Note: old up_axis / verified switches have been removed.
+  reuse_scene_roi: true
+  allow_new_revision: false
+  file_service:
+    platform: windows
+    host: 127.0.0.1
+    port: 8766
+  web:
+    host: 127.0.0.1
+    port: 8765
+  views:
+    elevation_candidates: 8
+    elevation_interval_deg: 45
+    max_elevation_views: 4

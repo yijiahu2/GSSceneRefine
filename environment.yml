@@ -1,0 +1,20 @@
+# ONE environment for all GSSceneRefine modules, including current ROI+UI+Poisson and future SDF cleanup.
+# In particular, do NOT activate gspl or sfm_surface to run this project.
+name: gsrefine
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - nodejs>=22,<23
+  - pip
+  - pip:
+      - "numpy>=1.24,<2.0"
+      - "scipy>=1.11,<2"
+      - "PyYAML>=6,<7"
+      - "trimesh>=4,<5"
+      - "shapely>=2,<3"
+      - "open3d==0.19.0"
+      - "plyfile>=1,<2"
+      - "scikit-image>=0.22,<1"
+      - "pytest>=8,<10"

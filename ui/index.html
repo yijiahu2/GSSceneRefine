@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GSSceneRefine · GeoGuard-ROI · 双正交工作区</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,'Microsoft YaHei',sans-serif;background:#101820;color:#dbe7e6}
+*{box-sizing:border-box}html,body{height:100%;margin:0}body{display:flex;flex-direction:column;overflow:hidden}
+header{height:62px;min-height:62px;padding:8px 16px;display:flex;align-items:center;gap:20px;background:#19262e;border-bottom:1px solid #354851}
+.brand{font-size:16px;font-weight:720}.sub{color:#8caaa6;font-size:11px;margin-top:2px}.controls{margin-left:auto;display:flex;align-items:center;flex-wrap:wrap;gap:9px}label{font-size:12px;color:#b4cfca}
+input,select,button{font:inherit}button,select,input[type=number]{color:#e0eeee;background:#293a42;border:1px solid #4a6770;border-radius:7px;padding:7px 10px;font-size:12px;cursor:pointer}
+button:hover{border-color:#66a59a;background:#304a51}button.primary{background:#167e62;border-color:#219f7d;font-weight:650}button.primary:hover{background:#1f9978}
+input[type=checkbox]{accent-color:#3bab86}input[type=range]{accent-color:#54ac91;width:104px;vertical-align:middle}
+#stage{position:relative;flex:1;min-height:150px;display:flex;overflow:hidden;background:#0e151b}
+#render-canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.pane{position:relative;z-index:2;width:50%;min-width:0;height:100%;border-right:1px solid #4b646b;touch-action:none;cursor:grab;overflow:hidden}
+.pane.drawing{cursor:crosshair}.pane:last-child{border-right:none}
+.pane-bar{position:absolute;z-index:8;top:12px;left:12px;right:12px;display:flex;gap:6px;align-items:flex-start;flex-wrap:wrap;pointer-events:none}
+.pane-bar>*{pointer-events:auto}.pane-title{padding:8px 10px;background:rgba(16,28,35,.85);border:1px solid #38515a;border-radius:8px;font-size:13px;font-weight:700}
+.tool{background:rgba(24,41,49,.93)}.tool.active{background:#126d55;border-color:#40b28b}
+#azimuth-panel{position:absolute;z-index:8;left:12px;right:12px;bottom:15px;display:flex;gap:5px;flex-wrap:wrap;pointer-events:none}
+#azimuth-panel>*{pointer-events:auto}.az{padding:7px 8px;background:rgba(19,34,42,.91)}.az.on{border-color:#64b59a;background:#144939}.az.saved:after{content:' ✓';color:#6fddaf}
+svg.draw-layer{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
+#status{min-height:48px;background:#16232b;border-top:1px solid #304951;padding:7px 15px;color:#a9c3bc;font-size:12px;display:flex;align-items:center;justify-content:space-between;gap:18px}
+#status-message{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#hint{font-size:11px;line-height:1.5;color:#8ea5a4}
+#details{color:#f1ce8b}.spacer{flex:1}.warn{color:#f5be84}
+.poisson-layer{position:absolute;inset:0;z-index:3;width:100%;height:100%;pointer-events:none}
+.draw-layer{z-index:5}
+.feedback-backdrop{position:fixed;z-index:1000;inset:0;background:rgba(4,13,20,.75);display:flex;align-items:center;justify-content:center;padding:16px}
+.feedback-backdrop[hidden],#feedback-path-row[hidden]{display:none!important}
+.feedback-box{background:#20323b;border:1px solid #52b79e;border-radius:12px;max-width:740px;width:min(100%,740px);padding:24px;box-shadow:0 14px 48px #0008;color:#edf6f2}
+.feedback-backdrop.error .feedback-box{border-color:#e6a575}
+.feedback-box h2{margin:0 0 12px;font-size:21px}
+.feedback-box p{white-space:pre-line;line-height:1.65;color:#d1e3de}
+.feedback-path{white-space:pre-wrap;overflow-wrap:anywhere;user-select:text;padding:12px;background:#101e26;border:1px solid #56777d;border-radius:7px;display:block;margin:8px 0;font-size:13px}
+.feedback-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:16px}
+button:disabled{opacity:.48;cursor:wait}
+@media (max-width:1150px){header{height:auto;min-height:62px;flex-wrap:wrap}.controls{margin:0}.pane-bar{right:6px}.pane-title{font-size:11px}}
+</style>
+</head><body>
+<header>
+<div><div class="brand">GSSceneRefine · GeoGuard-ROI <span style="color:#6fe2b4">模块一至四</span></div><div class="sub">原始Gaussian加载 · 双正交ROI粗选 · Poisson自适应恢复 · 最终PLY自动导出</div></div>
+<div class="controls">
+<label>COLMAP自动竖直方向 <span id="up-axis" title="由原始COLMAP相机姿态自动估计；不旋转原始模型" style="color:#9be0c8; font-size:11px">分析中</span></label>
+<label><input id="poisson-toggle" type="checkbox"> Poisson半透明</label>
+<label><input id="clip-toggle" type="checkbox"> 临时深度显示过滤</label>
+<label>可见深度 <input id="clip-scale" type="range" min="5" max="100" step="5" value="100"></label>
+<button id="reset-camera">重置取景</button><button id="roi-status" title="查看服务器上是否已有已确认的ROI文件">查看保存记录</button><button id="load-existing-roi" disabled title="默认不自动载入历史轮廓；仅在需要继续编辑时点击">载入已有ROI</button><button id="roi-preview">① 交集核查</button><button class="primary" id="confirm-roi">② 确认并保存ROI</button><button id="download-json">备份草稿JSON</button>
+</div>
+</header>
+<div id="stage">
+<canvas id="render-canvas"></canvas>
+<section class="pane" id="top-pane" data-kind="top">
+<canvas class="poisson-layer" id="top-poisson-layer" aria-hidden="true"></canvas>
+<div class="pane-bar">
+  <span class="pane-title">① 俯视工作区（Top）</span>
+  <button class="tool active" id="top-pan">移动/缩放</button><button class="tool" id="top-draw">绘制多边形</button>
+  <button class="tool" id="top-finish">完成圈选</button><button class="tool" id="top-clear">清除</button>
+</div><svg class="draw-layer" id="top-svg"></svg>
+</section>
+<section class="pane" id="front-pane" data-kind="front">
+<canvas class="poisson-layer" id="front-poisson-layer" aria-hidden="true"></canvas>
+<div class="pane-bar">
+  <span class="pane-title">② 立面工作区（Front）</span>
+  <button class="tool active" id="front-pan">移动/缩放</button><button class="tool" id="front-draw">绘制多边形</button>
+  <button class="tool" id="front-finish">保存当前面</button><button class="tool" id="front-clear">删除当前面</button>
+  <button class="tool" id="base-set">当前方位设为0°</button>
+</div><svg class="draw-layer" id="front-svg"></svg>
+<div id="azimuth-panel">
+  <label style="background:rgba(16,28,35,.9);padding:6px;border-radius:6px">旋转 <input id="heading" type="range" min="0" max="359" step="1" value="0"><span id="heading-value">0°</span></label>
+  <span id="az-buttons"></span>
+</div>
+</section>
+</div>
+<footer id="status">
+<div id="status-message">正在初始化...</div><div id="details">尚未保存ROI</div>
+<div id="hint">交集核查计算全部PLY中Gaussian中心；绿色点只是稀疏空间示意。Poisson叠加是辅助投影，不是可信主体判定；确认保存后自动运行Poisson主体恢复与局部Gaussian安全外扩，最终导出PLY。平移：移动模式拖动；缩放：滚轮；绘制：单击加顶点 → 完成；Esc取消草稿；Backspace撤销顶点</div>
+</footer>
+<div id="feedback-overlay" class="feedback-backdrop" hidden role="dialog" aria-modal="true" aria-labelledby="feedback-title">
+  <section class="feedback-box">
+    <h2 id="feedback-title">ROI保存状态</h2>
+    <p id="feedback-description"></p>
+    <div id="feedback-path-row" hidden><strong>文件路径（WSL）</strong><code id="feedback-path" class="feedback-path"></code></div>
+    <div class="feedback-actions"><button id="feedback-copy">复制保存路径</button><button class="primary" id="feedback-close">关闭</button></div>
+  </section>
+</div>
+<script type="module" src="./app.mjs?v=roi-latest-20261104"></script>
+</body></html>

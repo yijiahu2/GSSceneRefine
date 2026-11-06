@@ -1,0 +1,78 @@
+"""Synthetic deterministic regression for boundary-topology proposal."""
+from pathlib import Path
+import json
+import numpy as np
+import pytest
+import trimesh
+from .test_demo import build_synthetic_case
+from gsrefine.roi.core import ROI,Projection
+from gsrefine.roi.study import run as study_run
+from gsrefine.roi.boundary_analysis import angular_coverage,classify_view_edges
+from gsrefine.roi.surface_growth import saturated_growth
+from gsrefine.roi.candidate_classification import triage
+
+
+def test_boundary_edges_arbitrary_gravity():
+    up=np.array([.3,.4,.8660254]);up/=np.linalg.norm(up)
+    horizontal=np.cross(up,[1,0,0]);horizontal/=np.linalg.norm(horizontal)
+    right=np.cross(horizontal,up)
+    # Both axes are orthonormal in arbitrary COLMAP orientation.
+    view=Projection.from_json({'name':'facade_0deg','origin':[0,0,0],
+       'axes':[right.tolist(),up.tolist()],
+       'polygon':[[-1,-1],[1,-1],[1,1],[-1,1]]})
+    row=classify_view_edges(ROI([view]),up)
+    assert sorted(x['boundary_class'] for x in row)==['bottom','side','side','top']
+
+
+def test_ring_coverage_vs_small_arc():
+    angles=np.linspace(0,2*np.pi,160,endpoint=False)
+    circ=np.column_stack([np.cos(angles),np.sin(angles),np.zeros(len(angles))])
+    assert angular_coverage(circ,[0,0,1],[0,0,0])>.95
+    assert angular_coverage(circ[:16],[0,0,1],[0,0,0])<.2
+
+
+def test_explicit_ambiguous_versus_base_background():
+    v=triage(boundary_class='side',height_quantile=.15,
+       angular_coverage=.8,saturated=False,reaches_mesh_edge=False,external_area_ratio=.4)
+    assert v[0]=='normal'
+    v=triage(boundary_class='top',height_quantile=.9,angular_coverage=.1,
+       saturated=True,reaches_mesh_edge=False,external_area_ratio=.05)
+    assert v[0]=='suspect'
+    assert triage(boundary_class='plan_side',height_quantile=.5,
+       angular_coverage=.1,saturated=False,reaches_mesh_edge=True,external_area_ratio=.4)[0]=='uncertain'
+
+
+def test_growth_termination_heuristic():
+    assert saturated_growth([0,2,4,4.05,4.05])
+    assert not saturated_growth([0,2,4,6,8])
+
+
+def test_full_study_manual_label_and_background(tmp_path):
+    rock,bg=build_synthetic_case(tmp_path)
+    first=study_run(tmp_path/'config.yaml',tmp_path/'roi.json',tmp_path/'study',
+                    up_vector=[0,0,1],run_ablation=False)
+    assert first['R0_count']>0
+    info=json.loads((tmp_path/'study/candidate_groups.json').read_text())
+    assert len(info)>=1
+    assert sum(x['area'] for x in info)==pytest.approx(first['candidate']['initial_exterior_candidate_area'])
+    assert (tmp_path/'study/roi_boundary_trace.ply').exists()
+    assert (tmp_path/'study/exterior_uncertain.ply').exists()
+    labels={x['id']:'suspect' for x in info}
+    (tmp_path/'labels.json').write_text(json.dumps({'labels':labels}))
+    r=study_run(tmp_path/'config.yaml',tmp_path/'roi.json',tmp_path/'study2',
+         up_vector=[0,0,1],labels_file=tmp_path/'labels.json')
+    counts={x['method']:x['gaussian_count'] for x in r['ablation']}
+    assert counts['R1']>r['R0_count']
+    assert counts['R2']>=r['R0_count']
+    assert counts['R3']>=r['R0_count']
+    keep=np.load(tmp_path/'study2/keep_mask_R3.npy')
+    assert not keep[len(rock.vertices):].any(), 'Disconnected background must stay outside'
+    assert np.all(keep>=np.load(tmp_path/'study2/keep_mask_R0.npy'))
+
+
+def test_invalid_override_rejected(tmp_path):
+    build_synthetic_case(tmp_path)
+    (tmp_path/'bad.json').write_text(json.dumps({'labels':{'missing_id':'suspect'}}))
+    with pytest.raises(ValueError,match='Unknown group'):
+        study_run(tmp_path/'config.yaml',tmp_path/'roi.json',tmp_path/'out2',
+                  up_vector=[0,0,1],labels_file=tmp_path/'bad.json',run_ablation=False)

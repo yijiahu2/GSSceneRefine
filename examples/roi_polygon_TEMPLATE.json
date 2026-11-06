@@ -1,0 +1,19 @@
+{
+  "WARNING": "EXAMPLE GEOMETRY ONLY. These coordinates are not Songzi Guanyin ROI. Do not run as valid ROI until polygons are replaced.",
+  "coordinate_system": "original_COLMAP_world",
+  "polygon_units": "COLMAP_model_units_not_pixels",
+  "views": [
+    {
+      "name": "top",
+      "origin": [0.0, 0.0, 0.0],
+      "axes": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+      "polygon": [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]]
+    },
+    {
+      "name": "facade_0deg",
+      "origin": [0.0, 0.0, 0.0],
+      "axes": [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+      "polygon": [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]]
+    }
+  ]
+}

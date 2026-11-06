@@ -1,0 +1,81 @@
+# GSSceneRefine / GeoGuard-ROI example scene configuration. Edit paths to actual WSL files before running.
+# For new-scene Poisson, use `python run.py poisson`; this core stage does not clean internal artifacts,
+# and does NOT modify the input CKPT. The first run only uses existing files.
+paths:
+  # Stage-1 ORIGINAL Poisson, not a manually capped/sealed SDF mesh.
+  poisson_raw: /mnt/f/danxia_experiment_archive/Gaussian_pruning/poisson/sfm_poisson_colmap_original/04_poisson_raw.ply
+  clean_sfm_npz: /mnt/f/danxia_experiment_archive/Gaussian_pruning/poisson/sfm_poisson_colmap_original/02_sfm_clean_colmap_metadata.npz
+  # Existing AABB PLY is sufficient for DEBUG, but cannot recover Gaussians
+  # already removed by Task-1 AABB. For complete results, export original CKPT
+  # to FULL binary Gaussian PLY, retaining vertex row order, and switch this path.
+  gaussian_ply: /mnt/f/danxia_experiment_archive/Gaussian_pruning/task1_roi_pruning/results/models/roi_aabb.ply
+  roi_json: examples/roi_polygon_TEMPLATE.json
+  output_dir: runs/songziguanyin/roi_core
+
+source_model_scope: aabb_baseline_only
+export_ply: false            # false first: avoid creating huge PLYs until masks are checked
+modes: [hard, global, local]
+sfm:
+  knn_spacing: 6
+  confidence_weights: [0.35, 0.40, 0.25]
+  confidence_threshold: 0.75
+  local_fit_enabled: true       # exact local SfM->Poisson triangle distances; requires open3d
+  fit_knn: 16
+  fit_batch_size: 50000
+
+guards:
+  seed: 2026
+  inner_band_frac: 0.03     # fraction of PLY bounding-box diagonal
+  outside_search_frac: 0.025
+  geodesic_limit_frac: 0.04
+  max_extension_area_fraction: 0.10   # reject all exterior extension if exceeded
+  max_guard_add_fraction: 0.12        # fail closed on excessive guard Gaussian re-addition
+  max_surface_samples: 15000
+  local_radius_multiplier: 4.0
+  local_radius_min_frac: 0.002
+  local_radius_max_frac: 0.02
+  max_gaussian_neighbors: 64
+  min_gaussian_neighbors: 16
+  global_sample_cap: 6000
+  sigma_multiplier: 3.0
+  sfm_uncertainty_factor: 0.50
+  b_min_frac: 0.0005
+  b_max_frac: 0.012
+
+
+scene:
+  name: songziguanyin
+  method: absgs
+
+# MODULE 2 example. Do not directly overwrite an existing scene YAML.
+# Use: python tools/activate_roi_init.py --config configs/songziguanyin.yaml --scene songziguanyin --method absgs
+roi_init:
+  allow_new_revision: true
+  # By default source PLY and Poisson mesh come from the existing paths section.
+  output_dir: /home/xth/GSSceneRefine/runs/roi_init
+  orientation:
+    colmap_images: /home/xth/datasets/danxiashan/songziguanyin/sparse/images.bin
+    mode: auto
+  up_axis: "+z"
+  frame_id: songziguanyin_colmap_original
+  verified: true
+  reuse_scene_roi: true
+  allow_new_revision: false
+  file_service:
+    platform: windows
+    host: 127.0.0.1
+    port: 8766
+  web:
+    host: 127.0.0.1
+    port: 8765
+  views:
+    elevation_candidates: 8
+    elevation_interval_deg: 45
+    max_elevation_views: 4
+
+# Unified Modules 1-4 pipeline: launch Modules 3+4 after Module 2 confirms ROI.
+# Every numbered confirmed ROI has its own stable output directory, no code versions.
+workflow:
+  auto_after_confirm: true
+  final_method: R3
+  output_root: runs/roi_tests
