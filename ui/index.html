@@ -24,6 +24,16 @@ svg.draw-layer{position:absolute;inset:0;width:100%;height:100%;pointer-events:n
 #details{color:#f1ce8b}.spacer{flex:1}.warn{color:#f5be84}
 .poisson-layer{position:absolute;inset:0;z-index:3;width:100%;height:100%;pointer-events:none}
 .draw-layer{z-index:5}
+#workflow-panel{background:#17312e;border-bottom:1px solid #4b8775;padding:10px 16px;font-size:12px;display:flex;gap:16px;align-items:center;flex-wrap:wrap;z-index:12}
+#workflow-panel[hidden],#workflow-modal-progress[hidden]{display:none!important}
+#workflow-phase{font-weight:700;color:#d8fff1;min-width:190px}
+#workflow-steps{display:flex;gap:8px;flex-wrap:wrap;align-items:center;flex:1;min-width:270px}
+.workflow-step{padding:5px 9px;border:1px solid #506760;border-radius:5px;color:#9fb6af}
+.workflow-step.passed{background:#165641;color:#dbfff0;border-color:#4fb28b}
+.workflow-step.current{background:#184c70;color:#e6f5ff;border-color:#6cabd6}
+.workflow-step.failed{background:#652b29;color:#ffdbd5;border-color:#e18c7f}
+#workflow-details{font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere;color:#b9d7cf;max-width:100%}
+#workflow-modal-progress{padding:9px;background:#163b38;border-left:3px solid #6bd6ac;color:#e2fff7;white-space:pre-line;line-height:1.55}
 .feedback-backdrop{position:fixed;z-index:1000;inset:0;background:rgba(4,13,20,.75);display:flex;align-items:center;justify-content:center;padding:16px}
 .feedback-backdrop[hidden],#feedback-path-row[hidden]{display:none!important}
 .feedback-box{background:#20323b;border:1px solid #52b79e;border-radius:12px;max-width:740px;width:min(100%,740px);padding:24px;box-shadow:0 14px 48px #0008;color:#edf6f2}
@@ -37,15 +47,20 @@ button:disabled{opacity:.48;cursor:wait}
 </style>
 </head><body>
 <header>
-<div><div class="brand">GSSceneRefine · GeoGuard-ROI <span style="color:#6fe2b4">模块一至四</span></div><div class="sub">原始Gaussian加载 · 双正交ROI粗选 · Poisson自适应恢复 · 最终PLY自动导出</div></div>
+<div><div class="brand">GSSceneRefine · GeoGuard-ROI <span style="color:#6fe2b4">模块一至四</span></div><div class="sub">SfM净化与Poisson重建 · 双正交ROI粗选 · R3自适应恢复 · 最终PLY自动导出 · <span id="module1-ready">模块一准备中</span></div></div>
 <div class="controls">
 <label>COLMAP自动竖直方向 <span id="up-axis" title="由原始COLMAP相机姿态自动估计；不旋转原始模型" style="color:#9be0c8; font-size:11px">分析中</span></label>
 <label><input id="poisson-toggle" type="checkbox"> Poisson半透明</label>
-<label><input id="clip-toggle" type="checkbox"> 临时深度显示过滤</label>
-<label>可见深度 <input id="clip-scale" type="range" min="5" max="100" step="5" value="100"></label>
+<label title="仅在模块二临时隐藏Poisson主体外较远的Gaussian，原始PLY与最终ROI计算不变"><input id="clip-toggle" type="checkbox"> Poisson临时显示过滤</label>
+<label title="安全距离 = 全局Gaussian最长主轴双侧各5%截尾均值 × 倍数">安全距离倍数 <input id="clip-scale" type="range" min="25" max="400" step="25" value="100"> <span id="clip-value">1.00×</span></label>
 <button id="reset-camera">重置取景</button><button id="roi-status" title="查看服务器上是否已有已确认的ROI文件">查看保存记录</button><button id="load-existing-roi" disabled title="默认不自动载入历史轮廓；仅在需要继续编辑时点击">载入已有ROI</button><button id="roi-preview">① 交集核查</button><button class="primary" id="confirm-roi">② 确认并保存ROI</button><button id="download-json">备份草稿JSON</button>
 </div>
 </header>
+<section id="workflow-panel" hidden aria-live="polite">
+  <span id="workflow-phase">自动流程尚未启动</span>
+  <div id="workflow-steps"></div>
+  <span id="workflow-details"></span>
+</section>
 <div id="stage">
 <canvas id="render-canvas"></canvas>
 <section class="pane" id="top-pane" data-kind="top">
@@ -72,15 +87,15 @@ button:disabled{opacity:.48;cursor:wait}
 </div>
 <footer id="status">
 <div id="status-message">正在初始化...</div><div id="details">尚未保存ROI</div>
-<div id="hint">交集核查计算全部PLY中Gaussian中心；绿色点只是稀疏空间示意。Poisson叠加是辅助投影，不是可信主体判定；确认保存后自动运行Poisson主体恢复与局部Gaussian安全外扩，最终导出PLY。平移：移动模式拖动；缩放：滚轮；绘制：单击加顶点 → 完成；Esc取消草稿；Backspace撤销顶点</div>
+<div id="hint">临时Poisson过滤只影响显示，滑块松开后更新；安全距离以全局长轴5%截尾均值为基准。ROI交集始终计算原始完整PLY。Poisson叠加是辅助投影；模块一已准备SfM/Poisson几何输入；确认保存后自动进行R3主体恢复与安全外扩，最终导出PLY。平移：移动模式拖动；缩放：滚轮；绘制：单击加顶点 → 完成；Esc取消草稿；Backspace撤销顶点</div>
 </footer>
 <div id="feedback-overlay" class="feedback-backdrop" hidden role="dialog" aria-modal="true" aria-labelledby="feedback-title">
   <section class="feedback-box">
     <h2 id="feedback-title">ROI保存状态</h2>
-    <p id="feedback-description"></p>
+    <p id="feedback-description"></p><p id="workflow-modal-progress" hidden></p>
     <div id="feedback-path-row" hidden><strong>文件路径（WSL）</strong><code id="feedback-path" class="feedback-path"></code></div>
     <div class="feedback-actions"><button id="feedback-copy">复制保存路径</button><button class="primary" id="feedback-close">关闭</button></div>
   </section>
 </div>
-<script type="module" src="./app.mjs?v=roi-latest-20261104"></script>
+<script type="module" src="./app.mjs?v=roi-terminal-handoff-20261106"></script>
 </body></html>

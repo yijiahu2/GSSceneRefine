@@ -124,8 +124,11 @@ def test_manual_pipeline_dispatch_and_immutable_source(tmp_path, monkeypatch):
     import gsrefine.roi.study as study
     monkeypatch.setattr(study, 'run', fake_study)
     result = run_once(cfg, roi)
-    assert calls == [{'run_ablation': True, 'final_only': True,
-                      'export_final': True, 'final_method': 'R3'}]
+    assert len(calls) == 1
+    assert {key:value for key,value in calls[0].items() if key != 'progress_callback'} == {
+        'run_ablation': True, 'final_only': True, 'export_final': True,
+        'final_method': 'R3'}
+    assert callable(calls[0]['progress_callback'])
     assert result['final_gaussians'] == 15
     assert result['final_ply'].endswith('gaussians_final_R3.ply')
     assert _sha_same(settings.gaussian_ply, source_sha)
@@ -190,6 +193,11 @@ def test_real_http_confirm_to_final_R3_ply(tmp_path):
         assert status['core_restored_gaussians'] + status['safety_added_gaussians'] == status['added_gaussians']
         assert not (out / 'keep_mask_R1.npy').exists()
         assert not (out / 'keep_mask_R2.npy').exists()
+        # Preserve the original research/diagnostic output contract.
+        assert (out / 'candidate_groups.json').exists()
+        assert (out / 'full_exterior_faces.npz').exists()
+        assert (out / 'kept_indices_R3.npy').exists()
+        assert (out / 'restored_indices_R3.npy').exists()
     finally:
         server.shutdown()
         server.server_close()

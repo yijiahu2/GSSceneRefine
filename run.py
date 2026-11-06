@@ -6,6 +6,7 @@ Usage:
   python run.py roi-init --config configs/songziguanyin.yaml
   python run.py ui --config configs/songziguanyin.yaml  # legacy/debug
   python run.py roi --config configs/songziguanyin.yaml --roi FILE.json
+  python run.py scene-prepare --config configs/songziguanyin.yaml
   python run.py poisson --help
   python run.py sfm-clean --help
   python run.py roi-auto --config configs/songziguanyin.yaml --roi FILE.json
@@ -30,6 +31,7 @@ COMMANDS = {
     'roi-study':'gsrefine.roi.study',
     'roi-finalize':'gsrefine.roi.finalize',
     'poisson':'gsrefine.geometry.poisson',
+    'scene-prepare':'gsrefine.geometry.prepare',
     'sfm-clean':'gsrefine.geometry.sfm_clean',
     'roi-debug':'tools.make_roi_from_aabb',
     'doctor':'gsrefine.doctor',

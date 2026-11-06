@@ -40,7 +40,7 @@ def read_manifest(directory: Path):
     return d
 
 
-def require_orientation(payload, settings):
+def require_orientation(payload, settings, *, reuse_scene_geometry=False):
     """A saved ROI must use the SAME ORIGINAL COLMAP world-up, not a label.
 
     The camera/gaussian/Poisson models must not be rotated for display. For
@@ -59,10 +59,17 @@ def require_orientation(payload, settings):
     expected_hash=settings.orientation_result.get('source_sha256')
     if frame.get('orientation_source_sha256')!=expected_hash:
         raise ValueError('ROI orientation source differs from configured COLMAP model')
-    if frame.get('scene') != settings.scene or frame.get('method') != settings.method:
-        raise ValueError('ROI scene/method does not match config')
-    if frame.get('source_ply') != str(settings.gaussian_ply):
-        raise ValueError('ROI source PLY does not match configured model')
+    if frame.get('scene') != settings.scene:
+        raise ValueError('ROI scene does not match configured scene')
+    same_source = (frame.get('source_ply') == str(settings.gaussian_ply))
+    same_method = (frame.get('method') == settings.method)
+    if not same_source or not same_method:
+        if not reuse_scene_geometry:
+            raise ValueError('ROI scene/method or source PLY does not match config; '
+                             'use explicit --reuse-scene-roi for another method')
+        if settings.model_scope != 'full_reconstruction' or frame.get('source_model_scope') != 'full_reconstruction':
+            raise ValueError('Cross-method ROI reuse requires two complete, verified full-scene models; '
+                             'confirm a fresh full-scene ROI to upgrade legacy metadata')
     views=view_record_validate(payload)
     top=next(v for v in views.views if v.name=='top')
     if not np.allclose(np.cross(top.U[0],top.U[1]),expected,rtol=0.,atol=1e-6):
@@ -153,6 +160,49 @@ def current_latest(settings):
     return file
 
 
+
+def _same_source_roi(path, settings):
+    """Require the model used when the annotation was confirmed to match.
+
+    AABB and full PLY may share the same SfM frame, but their saved ROI counts
+    and downstream masks MUST NOT silently be treated as interchangeable.
+    """
+    try:
+        meta = json.loads(Path(path).read_text(encoding='utf8')).get('annotation_metadata', {})
+        return (meta.get('source_ply') == str(settings.gaussian_ply)
+                and meta.get('method') == settings.method
+                and meta.get('frame_id') == settings.frame_id
+                and meta.get('orientation_source_sha256') == settings.orientation_result.get('source_sha256'))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def current_latest_for_source(settings):
+    """Latest confirmed annotation for this exact Gaussian model, not merely scene."""
+    manifest = read_manifest(settings.out_dir)
+    # Retain original manifest integrity checks even if switching model sources.
+    latest = current_latest(settings)
+    if latest is None:
+        return None
+    for record in reversed(manifest.get('records', [])):
+        if record.get('scene') != settings.scene:
+            continue
+        if record.get('source_ply') != str(settings.gaussian_ply):
+            continue
+        path = settings.out_dir / record['filename']
+        if _same_source_roi(path, settings):
+            return path
+    # Legacy manifest has only canonical pointer.
+    if not manifest.get('records') and _same_source_roi(latest, settings):
+        return latest
+    return None
+
+
+def current_canonical_for_source(settings):
+    """Use the original scene canonical only when it came from this model."""
+    path = current_canonical(settings)
+    return path if path and _same_source_roi(path, settings) else None
+
 def save_confirmed_roi(payload, settings, preview=None, *, new_revision=False):
     require_orientation(payload,settings)
     if preview is None:preview=gaussian_roi_preview(payload,settings)
@@ -182,6 +232,7 @@ def save_confirmed_roi(payload, settings, preview=None, *, new_revision=False):
         saved=datetime.now(timezone.utc).isoformat()
         payload=json.loads(json.dumps(payload))
         payload['annotation_metadata']['confirmed_utc']=saved
+        payload['annotation_metadata']['source_model_scope']=settings.model_scope
         payload['annotation_metadata']['view_sha256']=canonical_views_sha(payload)
         payload['annotation_metadata']['initial_gaussian_roi_count']=preview['gaussian_roi_count']
         payload['annotation_metadata']['initial_gaussian_roi_fraction']=preview['roi_fraction']

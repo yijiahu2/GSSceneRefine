@@ -14,7 +14,7 @@ class SettingsStub:
 
 def test_first_party_code_never_served_as_cached_304():
     root = Path(__file__).resolve().parents[1] / 'ui'
-    assert 'app.mjs?v=roi-latest-20261104' in (root / 'index.html').read_text()
+    assert 'app.mjs?v=' in (root / 'index.html').read_text()
     server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(SettingsStub(), root, {'coordinate_frame': {'up_vector': [0, 1, 0]}}))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

@@ -20,7 +20,7 @@ import numpy as np
 import trimesh
 import yaml
 from scipy.spatial import cKDTree
-from scipy.sparse.csgraph import connected_components
+from scipy.sparse.csgraph import connected_components, dijkstra
 from .core import (ROI, GaussianPLY, file_sha256, geometry_confidence,
                    load_sfm, mesh_external_candidates, local_protection,
                    add_guard_gaussians, json_write)
@@ -49,6 +49,98 @@ def _write_faces(mesh, selected, path, color=None):
     if color is not None:geom.visual.face_colors=np.tile(np.array(color,dtype=np.uint8),(len(geom.faces),1))
     geom.export(path)
     return True
+
+
+
+def anchored_local_recovery_faces(mesh, roi, selected_faces, inside_faces,
+                                  max_geodesic_distance):
+    """Limit Stage-A restoration to locally continuous Poisson extensions.
+
+    This is a *second, stage-A-only* geometry gate. It never changes the
+    exterior classification, R0, R1/R2, or Stage-B Gaussian safety rule.
+
+    A starting exterior face must directly share a triangle edge with an
+    ROI-interior face, OR itself straddle the ROI boundary. Propagation then
+    uses only the selected suspect-face adjacency graph, never jumps across
+    nonselected/normal faces or free space. Multi-source intrinsic distance
+    is limited using an existing scene guard distance; no positional rules.
+    """
+    selected = np.asarray(selected_faces, dtype=bool)
+    inside = np.asarray(inside_faces, dtype=bool)
+    count = len(mesh.faces)
+    if selected.shape != (count,) or inside.shape != (count,):
+        raise ValueError('Poisson face masks must match mesh.faces')
+    if np.any(selected & inside):
+        raise ValueError('Stage-A suspect faces must be outside ROI')
+    if not np.isfinite(max_geodesic_distance) or max_geodesic_distance <= 0:
+        raise ValueError('Positive finite geodesic extent required')
+    areas = np.asarray(mesh.area_faces, dtype=float)
+    result = np.zeros(count, dtype=bool)
+    if not np.any(selected):
+        return result, {
+            'algorithm': 'roi_anchored_suspect_surface_geodesic',
+            'selected_faces_before': 0, 'selected_faces_after': 0,
+            'boundary_seed_faces': 0, 'max_geodesic_distance': float(max_geodesic_distance),
+            'removed_faces': 0, 'selected_area_before': 0.,
+            'selected_area_after': 0., 'removed_area': 0.,
+            'unanchored_faces': 0, 'beyond_reach_faces': 0,
+        }
+    adj = np.asarray(mesh.face_adjacency, dtype=np.int64).reshape(-1, 2)
+    crossing = adj[selected[adj[:, 0]] & inside[adj[:, 1]]]
+    reverse = adj[selected[adj[:, 1]] & inside[adj[:, 0]]]
+    seeds = np.zeros(count, dtype=bool)
+    if len(crossing):
+        seeds[crossing[:, 0]] = True
+    if len(reverse):
+        seeds[reverse[:, 1]] = True
+
+    # A triangle intersected by the polygon boundary can have its centroid
+    # outside without any neighbouring face-centroid classified as inside.
+    # This protects genuine small truncated tips against centroid aliasing.
+    vertices = np.asarray(mesh.vertices, dtype=float)
+    vertex_inside = np.all(roi.distances(vertices) >= -1e-9, axis=1)
+    ids = np.flatnonzero(selected)
+    tris = np.asarray(mesh.faces, dtype=np.int64)[ids]
+    any_inside = np.any(vertex_inside[tris], axis=1)
+    any_outside = np.any(~vertex_inside[tris], axis=1)
+    seeds[ids[any_inside & any_outside]] = True
+    seeds &= selected
+
+    if np.any(seeds):
+        # Graph edges join face centers only through an actual shared edge.
+        # Full-scene generic shortest paths can travel via normal perimeter
+        # and re-enter another suspect patch; explicitly disallow this.
+        graph = face_graph(mesh, selected)
+        dist = dijkstra(graph, directed=False, indices=np.flatnonzero(seeds),
+                        min_only=True, limit=float(max_geodesic_distance))
+        result = selected & np.isfinite(dist) & (dist <= max_geodesic_distance)
+        # The capped shortest-path solver returns inf both for disconnected
+        # and over-limit faces. Separate these causes using mesh connectivity.
+        _, components = connected_components(graph, directed=False)
+        has_seed = np.zeros(count, dtype=bool)
+        has_seed[components[seeds]] = True
+        reached = selected & has_seed[components]
+    else:
+        # No interior-connected seeds: never recover an isolated suspect island
+        # just because its centroid is spatially close to a selected object.
+        reached = np.zeros(count, bool)
+    removed = selected & ~result
+    return result, {
+        'algorithm': 'roi_anchored_suspect_surface_geodesic',
+        'selected_faces_before': int(selected.sum()),
+        'selected_faces_after': int(result.sum()),
+        'boundary_seed_faces': int(seeds.sum()),
+        'max_geodesic_distance': float(max_geodesic_distance),
+        'removed_faces': int(removed.sum()),
+        'selected_area_before': float(areas[selected].sum()),
+        'selected_area_after': float(areas[result].sum()),
+        'removed_area': float(areas[removed].sum()),
+        'unanchored_faces': int(np.count_nonzero(selected & ~reached)),
+        'beyond_reach_faces': int(np.count_nonzero(reached & ~result)),
+        'connectivity': 'original_triangle_edge_adjacency_only',
+        'seed_rule': 'ROI_interior_edge_contact_or_boundary_straddling_face',
+        'scope': 'R3_stage_A_only',
+    }
 
 
 def analyze(mesh, roi, conf, threshold, diag, guard_cfg, up, *,
@@ -277,13 +369,14 @@ def analyze(mesh, roi, conf, threshold, diag, guard_cfg, up, *,
 
 def run(config,roi_file,output_dir, labels_file=None, *, export_ply=False,
         run_ablation=True, up_vector=None, gaussian_path=None,
-        export_final=True, final_method='R3', final_only=False):
+        export_final=True, final_method='R3', final_only=False, progress_callback=None):
     if final_only and (not run_ablation or final_method != 'R3' or export_ply):
         raise ValueError('final_only requires R3, run_ablation, and no comparison PLY exports')
     config=Path(config).resolve();cfg=yaml.safe_load(config.read_text(encoding='utf8'))
     if not isinstance(cfg,dict):raise ValueError('Config YAML not a mapping')
     out=Path(output_dir).resolve();out.mkdir(parents=True,exist_ok=True)
     roi=ROI.from_file(roi_file)
+    if progress_callback: progress_callback('loading', '加载Poisson网格及完整Gaussian PLY')
     paths=cfg['paths'];meshfile=Path(paths['poisson_raw']);sfmfile=Path(paths['clean_sfm_npz'])
     plyfile=Path(gaussian_path or paths['gaussian_ply'])
     mesh=trimesh.load(meshfile,process=False)
@@ -336,6 +429,7 @@ def run(config,roi_file,output_dir, labels_file=None, *, export_ply=False,
     e=np.asarray(mesh.edges_sorted);unique,count=np.unique(e,axis=0,return_counts=True)
     flags=np.zeros(len(mesh.vertices),bool);flags[unique[count==1].reshape(-1)]=True
     mesh._roi_boundary_vertex_flags=flags
+    if progress_callback: progress_callback('poisson', 'Poisson外围连通性与误截断候选识别')
     analysis=analyze(mesh,roi,conf,conf_threshold,diag,
                      cfg['guards'],up,candidate_labels=overrides,
                      study_cfg=cfg.get('roi_study',{}),
@@ -407,13 +501,31 @@ def run(config,roi_file,output_dir, labels_file=None, *, export_ply=False,
             ('R1',r1,'global'),('R2',selected,'global'),('R3',selected,'local')]
         for name,exterior,mode in methods:
             if name == 'R3':
+                if progress_callback: progress_callback('core', 'ROI内部曲面种子与局部连续恢复范围验证')
+                # The existing first-pass candidate classifier is unchanged.
+                # This gate limits Stage-A Gaussian recovery to local Poisson
+                # extensions that genuinely attach to ROI-interior geometry.
+                # The original 0.04D path cap is only an upper bound; use the
+                # smaller existing outside-search scale to reject long
+                # tangential continuations of otherwise short outside patches.
+                geo_limit = min(float(cfg['guards']['geodesic_limit_frac']),
+                                float(cfg['guards']['outside_search_frac'])) * diag
+                recovery_faces, anchored_info = anchored_local_recovery_faces(
+                    mesh, roi, exterior, analysis['inside'], geo_limit)
+                _write_faces(mesh, recovery_faces, out/'exterior_r3_recovery_eligible.ply',
+                             [35, 188, 88, 255])
+                _write_faces(mesh, exterior & ~recovery_faces,
+                             out/'exterior_r3_recovery_rejected.ply',
+                             [228, 101, 55, 255])
+                if progress_callback: progress_callback('core', '恢复有限连通Poisson曲面支持的局部主体')
                 core, extra, kept, two_stage_info = recover_two_stage_from_poisson(
-                    roi=roi, mesh=mesh, selected_faces=exterior,
+                    roi=roi, mesh=mesh, selected_faces=recovery_faces,
                     gaussian_ply=ply, positions=xyz, original_mask=basemask,
                     diag=diag,
                     k_neighbors=int(cfg.get('guards',{}).get('safety_knn',128)),
                     trim_fraction=0.05,
-                    safety_factor=1.0)
+                    safety_factor=1.0, progress_callback=progress_callback)
+                two_stage_info['stage_A']['anchored_local_recovery'] = anchored_info
                 addition = float(np.count_nonzero(kept & ~basemask)) / max(1, int(basemask.sum()))
                 allowed = float(cfg['guards']['max_guard_add_fraction'])
                 two_stage_info['review_required'] = bool(addition > allowed)
@@ -471,6 +583,7 @@ def run(config,roi_file,output_dir, labels_file=None, *, export_ply=False,
     # Stage 1 / Module 4: materialize a real Gaussian PLY from validated masks.
     # The default exports ONE R3 PLY; --export-ply still provides R0--R3.
     if export_final and run_ablation:
+        if progress_callback: progress_callback('exporting', '写入最终Gaussian R3 PLY并校验属性')
         from .finalize import finalize
         result=finalize(out,method=final_method,gaussian_path=plyfile,
                         report=report,source_ply=ply,verify_input_hash=False)

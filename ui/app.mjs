@@ -12,13 +12,15 @@ const vec=a=>new pc.Vec3(...a);
 const toArr=v=>[v.x,v.y,v.z];
 const round=(a,n=8)=>a.map(x=>+x.toFixed(n));
 const stage=byId('stage');
-let meta,app,gsplatEntity,poissonEntity;
+let meta,app,gsplatEntity,gsplatAsset,poissonEntity;
+let displayFilterBusy=false;
 let poissonPreview=null;
 let poissonVisible=false;
 const poissonDrawQueued={top:false,front:false};
 let roiRequestBusy=false;
 let workflowTimer=null;
 let workflowNoticeKey=null;
+let workflowChecking=false;
 let intersectionPreview=null;
 let up=[0,0,1],baseYaw=0,currentAngle=0,frontIdx=0;
 const drawn={top:null,facades:new Map()};
@@ -39,12 +41,7 @@ function ensureCamera(kind){
  s.camera.camera.orthoHeight=s.halfHeight;
  s.camera.camera.nearClip=Math.max(meta.scene_diagonal*.0001,d-meta.scene_diagonal*2);
  s.camera.camera.farClip=d+meta.scene_diagonal*2;
- if(byId('clip-toggle').checked){
-   const fraction=Number(byId('clip-scale').value)/100;
-   const halfRange=Math.max(meta.scene_diagonal*.01,meta.scene_diagonal*fraction*.75);
-   s.camera.camera.nearClip=Math.max(meta.scene_diagonal*.0001,d-halfRange);
-   s.camera.camera.farClip=d+halfRange;
- }
+
 }
 function refit(kind){
  const s=panels[kind];const bounds=meta.reference_bounds;
@@ -223,7 +220,7 @@ function exportROI(){
     orientation_verified:meta.coordinate_frame.verified,
     scene:meta.scene,method:meta.method,source_ply:meta.source_ply,base_azimuth_deg:baseYaw,
     reference_center:meta.reference_center,view_count:views.length,
-    notes:'Display-only Poisson overlay / temporary depth clipping did not change ROI or Gaussian model.'}
+    notes:'Display-only Poisson overlay / Poisson temporary preview did not change ROI or source Gaussian PLY.'}
  };
 }
 function updateHeading(deg){
@@ -237,6 +234,96 @@ function updateHeading(deg){
  frontIdx=snap.i;
  ensureCamera('front');drawOverlay('front');updateChoices();
 }
+// Module-level workflow functions must be visible to init() and ROI button handlers.
+// Live workflow information survives closing the save dialog, refresh and
+// browser reconnection because the server persists each real processing stage.
+const workflowSteps=[
+ ['validating','输入检查'],['loading','模型加载'],['poisson','Poisson识别'],
+ ['core','主体恢复'],['safety','安全外扩'],['exporting','PLY导出'],
+ ['verifying','结果核验'],['completed','完成']
+];
+function renderWorkflowStatus(job){
+ const panel=byId('workflow-panel');
+ if(!job?.enabled||job.status==='idle'){panel.hidden=true;return;}
+ panel.hidden=false;
+ const idx=Number(job.phase_index??0);
+ const current=job.status==='failed'?'failed':job.status==='completed'?'completed':job.phase;
+ byId('workflow-phase').textContent=job.status==='failed'?'自动处理失败':
+  job.status==='completed'?'R3最终模型已生成':(job.phase_label||'自动流程运行中');
+ const steps=byId('workflow-steps');steps.replaceChildren();
+ for(const [phase,label] of workflowSteps){
+  const span=document.createElement('span');span.className='workflow-step';span.textContent=label;
+  const pos=workflowSteps.findIndex(x=>x[0]===phase)+1;
+  if(job.status==='completed'||idx>pos)span.classList.add('passed');
+  else if(job.status==='failed'&&idx===pos)span.classList.add('failed');
+  else if(phase===current)span.classList.add('current');
+  steps.append(span);
+ }
+ const elapsed=job.started_utc?Math.max(0,Math.floor((Date.now()-Date.parse(job.started_utc))/1000)):null;
+ const duration=elapsed==null||!Number.isFinite(elapsed)?'':`已运行 ${Math.floor(elapsed/60)}分${elapsed%60}秒`;
+ const extra=job.status==='completed'?`最终 ${Number(job.final_gaussians).toLocaleString()} 个Gaussian\n${job.final_ply}`:
+   job.status==='failed'?`${job.error||'请查看workflow.log'}\n${job.log||''}`:
+   `${job.phase_detail||'后台计算仍在进行'}${duration?' · '+duration:''}\n日志：${job.log||''}`;
+ byId('workflow-details').textContent=extra;
+ const modal=byId('workflow-modal-progress');
+ modal.hidden=false;
+ modal.textContent=`实时进度：${byId('workflow-phase').textContent}\n${extra}`;
+}
+async function checkWorkflow(expectedRoi=null){
+ if(workflowChecking)return null;
+ workflowChecking=true;
+ try{
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),12000);
+  let response;
+  try{response=await fetch('/api/workflow-status',{cache:'no-store',signal:controller.signal});}
+  finally{clearTimeout(timeout);}
+  const job=await response.json();
+  if(!response.ok)throw Error(job.error||`HTTP ${response.status}`);
+  if(!job.enabled||job.status==='idle'){renderWorkflowStatus(job);return job;}
+  if(expectedRoi&&job.roi!==expectedRoi)return job;
+  renderWorkflowStatus(job);
+  const label=job.roi?.split('/').pop()||'当前ROI';
+  if(job.status==='running'){
+   msg(`已保存 ${label}；${job.phase_label||'后续流程正在自动运行'}...`);
+   byId('details').textContent='自动处理中 · '+label;
+  }else if(job.status==='completed'){
+   const file=job.final_ply;
+   msg(`R3最终ROI Gaussian模型已导出：${file}`);
+   byId('details').textContent=`最终 ${Number(job.final_gaussians).toLocaleString()} 个Gaussian`;
+   const key=`completed:${job.roi_sha256}:${file}`;
+   if(workflowNoticeKey!==key){
+    workflowNoticeKey=key;
+    showFeedback('success','四模块流程完成',
+      `模块一SfM/Poisson准备 → 模块二粗选ROI → 模块三局部主体恢复与自适应保护 → 模块四PLY已导出。\n原始ROI：${Number(job.R0_gaussians).toLocaleString()} 个Gaussian；主体恢复：${job.core_restored_gaussians==null?'见报告':Number(job.core_restored_gaussians).toLocaleString()} 个；安全外扩：${job.safety_added_gaussians==null?'见报告':Number(job.safety_added_gaussians).toLocaleString()} 个；最终：${Number(job.final_gaussians).toLocaleString()} 个。\n可直接将最终PLY导入SuperSplat。`,file);
+   }
+   if(workflowTimer){clearInterval(workflowTimer);workflowTimer=null;}
+  }else if(job.status==='failed'){
+   const key=`failed:${job.roi_sha256}:${job.return_code}`;
+   msg(`ROI已保存，但后续自动计算失败：${job.error||'查看日志'}`,true);
+   byId('details').textContent='自动计算未完成 · ROI已保留';
+   if(workflowNoticeKey!==key){
+    workflowNoticeKey=key;
+    showFeedback('error','自动处理失败（初始ROI已保存）',
+      `${job.error||'请查看运行日志'}\n无需重新圈选ROI，可检查日志后使用roi-auto重跑。`,job.log||'');
+   }
+   if(workflowTimer){clearInterval(workflowTimer);workflowTimer=null;}
+  }
+  return job;
+ }catch(e){
+  console.warn('[roi-init] Cannot query automatic workflow:',e);
+  const panel=byId('workflow-panel');
+  if(!panel.hidden)byId('workflow-details').textContent=`状态查询暂时中断（${e.message}），计算任务不会因此停止。`;
+  return null;
+ }finally{workflowChecking=false;}
+}
+function monitorWorkflow(expectedRoi=null){
+ if(workflowTimer)clearInterval(workflowTimer);
+ workflowNoticeKey=null;
+ void checkWorkflow(expectedRoi);
+ workflowTimer=setInterval(()=>void checkWorkflow(expectedRoi),2500);
+}
+
 function wireControls(){
  wirePane('top');wirePane('front');
  // Original COLMAP vertical is data-derived, not a manually selected axis.
@@ -248,7 +335,15 @@ function wireControls(){
   msg(`已以 ${Math.round(baseYaw)}° 为参考方向生成其余7个候选立面。`);
  };
  byId('reset-camera').onclick=()=>{for(const k of ['top','front']){panels[k].focus=[...meta.reference_center];refit(k);}msg('已恢复模型参考范围。');};
- const clipChange=()=>redrawAll();byId('clip-toggle').onchange=clipChange;byId('clip-scale').oninput=clipChange;
+ // Display-only Poisson mask. The previous UI control only clipped camera depth;
+ // this replacement actually filters Gaussian centers against the module-1 surface.
+ byId('clip-toggle').onchange=()=>void applyPoissonDisplayFilter();
+ byId('clip-scale').oninput=()=>updateDisplayBufferLabel();
+ // A new model is prepared only on release, not on every slider pixel change.
+ byId('clip-scale').onchange=()=>{
+  if(byId('clip-toggle').checked)void applyPoissonDisplayFilter();
+ };
+ updateDisplayBufferLabel();
  byId('poisson-toggle').onchange=async()=>{
   const checked=byId('poisson-toggle').checked;
   if(checked){
@@ -328,50 +423,6 @@ function wireControls(){
       '当前配置的统一ROI成果目录中没有该场景的已确认ROI。',status.saved_path||'');
   }catch(err){showFeedback('error','读取保存状态失败',err.message);}
  };
-// Status belongs to the server-side job; closing the feedback modal does not
-// stop computation. Do not show a success message until Module 4 PLY exists.
-async function checkWorkflow(expectedRoi=null){
- try{
-  const response=await fetch('/api/workflow-status',{cache:'no-store'});
-  const job=await response.json();
-  if(!response.ok)throw Error(job.error||`HTTP ${response.status}`);
-  if(!job.enabled||job.status==='idle')return job;
-  if(expectedRoi&&job.roi!==expectedRoi)return job;
-  const label=job.roi?.split('/').pop()||'当前ROI';
-  if(job.status==='running'){
-   msg(`已保存 ${label}；模块三Poisson恢复与R3安全外扩、模块四PLY导出正在自动运行...`);
-   byId('details').textContent='自动处理正在运行 · '+label;
-  }else if(job.status==='completed'){
-   const file=job.final_ply;
-   msg(`R3最终ROI Gaussian模型已导出：${file}`);
-   byId('details').textContent=`最终 ${Number(job.final_gaussians).toLocaleString()} 个Gaussian`;
-   const key=`completed:${job.roi_sha256}`;
-   if(workflowNoticeKey!==key){
-    workflowNoticeKey=key;
-    showFeedback('success','四模块流程完成',
-      `模块一加载 → 模块二粗选ROI → 模块三局部主体恢复与自适应保护 → 模块四PLY已导出。\n原始ROI：${Number(job.R0_gaussians).toLocaleString()} 个Gaussian；主体恢复：${job.core_restored_gaussians==null?'见报告':Number(job.core_restored_gaussians).toLocaleString()} 个；安全外扩：${job.safety_added_gaussians==null?'见报告':Number(job.safety_added_gaussians).toLocaleString()} 个；最终：${Number(job.final_gaussians).toLocaleString()} 个。\n可直接将最终PLY导入SuperSplat。`,file);
-   }
-   if(workflowTimer){clearInterval(workflowTimer);workflowTimer=null;}
-  }else if(job.status==='failed'){
-   const key=`failed:${job.roi_sha256}:${job.return_code}`;
-   msg(`ROI已保存，但后续自动计算失败：${job.error||'查看日志'}`,true);
-   byId('details').textContent='自动计算未完成 · ROI已保留';
-   if(workflowNoticeKey!==key){
-    workflowNoticeKey=key;
-    showFeedback('error','自动处理失败（初始ROI已保存）',
-      `${job.error||'请查看运行日志'}\n可通过日志排查，或使用roi-auto命令重跑；不需要重新圈选ROI。`,job.log||'');
-   }
-   if(workflowTimer){clearInterval(workflowTimer);workflowTimer=null;}
-  }
-  return job;
- }catch(e){console.warn('[roi-init] Cannot query automatic workflow:',e);return null;}
-}
-function monitorWorkflow(expectedRoi=null){
- if(workflowTimer)clearInterval(workflowTimer);
- workflowNoticeKey=null;
- void checkWorkflow(expectedRoi);
- workflowTimer=setInterval(()=>void checkWorkflow(expectedRoi),2500);
-}
 const previewOrConfirm=async(confirmSave)=>{
 
   if(roiRequestBusy)return;
@@ -405,13 +456,14 @@ const previewOrConfirm=async(confirmSave)=>{
     msg(`ROI已保存（下游默认最新）：${savedPath}；${number}个中心保留。`);
     byId('feedback-copy').textContent='复制保存路径';
     const job=answer.workflow;
+    if(job&&!meta.workflow?.terminal_handoff)renderWorkflowStatus(job);
     if(job?.status==='failed'){
      showFeedback('error','ROI已保存，但自动任务未启动',
        `${caption}\n${job.error||'请检查服务器日志'}。`,savedPath);
     }else{
-     const processing=job?.status==='running'?'\n已自动启动模块三R3恢复与模块四PLY导出，完成后会显示最终模型路径。':'';
+     const processing=job?.status==='running'?(meta.workflow?.terminal_handoff?'\n已启动模块三与模块四；浏览器服务即将关闭，请在WSL终端查看进度和最终PLY路径。':'\n已自动启动模块三R3恢复与模块四PLY导出，完成后会显示最终模型路径。'):'';
      showFeedback('success',answer.saved_as_revision?'ROI新版本保存成功':'ROI保存成功',caption+processing,savedPath);
-     if(job?.status==='running')monitorWorkflow(savedPath);
+     if(job?.status==='running'&&!meta.workflow?.terminal_handoff)monitorWorkflow(savedPath);
     }
    } else {
     msg(`初始ROI交集核查完成：完整Gaussian中心保留 ${number}/${meta.gaussians.toLocaleString()}（${ratio}%）。。`);
@@ -450,8 +502,70 @@ async function loadGaussian(){
  await new Promise((resolve,reject)=>{asset.on('load',resolve);asset.on('error',reject);app.assets.load(asset);});
  gsplatEntity=new pc.Entity('Raw Gaussian (unaltered)');
  // No Euler rotation. Gaussian PLY coordinates remain the original COLMAP frame.
- gsplatEntity.addComponent('gsplat',{asset});app.root.addChild(gsplatEntity);
+ gsplatEntity.addComponent('gsplat',{asset});app.root.addChild(gsplatEntity);gsplatAsset=asset;
  console.info(`[GSSceneRefine] Gaussian asset ready in ${((performance.now()-start)/1000).toFixed(2)} s; type=${meta.display_format}`);
+}
+
+function updateDisplayBufferLabel(){
+ const m=Number(byId('clip-scale').value)/100;
+ byId('clip-value').textContent=`${m.toFixed(2)}×`;
+}
+async function replaceDisplayGaussian(url, label){
+ // Keep the current scene visible until the replacement has finished loading.
+ // Only this display entity is changed; full source PLY and ROI remain untouched.
+ const newAsset=new pc.Asset(`GSSceneRefine ${label}`,'gsplat',{url});
+ app.assets.add(newAsset);
+ try{
+  await new Promise((resolve,reject)=>{
+   newAsset.on('load',resolve);newAsset.on('error',reject);app.assets.load(newAsset);
+  });
+  const next=new pc.Entity(`Display Gaussian (${label})`);
+  next.addComponent('gsplat',{asset:newAsset});
+  app.root.addChild(next);
+  const previous=gsplatEntity,previousAsset=gsplatAsset;
+  gsplatEntity=next;gsplatAsset=newAsset;
+  if(previous)previous.destroy();
+  if(previousAsset){previousAsset.unload();app.assets.remove(previousAsset);}
+ }catch(err){
+  newAsset.unload();app.assets.remove(newAsset);
+  throw err;
+ }
+}
+async function applyPoissonDisplayFilter(){
+ if(displayFilterBusy||!meta||!app||!gsplatEntity)return;
+ const checked=byId('clip-toggle').checked;
+ if(checked&&!meta.poisson_loaded){
+  byId('clip-toggle').checked=false;
+  msg('没有可用于临时过滤的模块一Poisson曲面。',true);return;
+ }
+ displayFilterBusy=true;
+ byId('clip-toggle').disabled=true;
+ byId('clip-scale').disabled=true;
+ try{
+  if(!checked){
+   msg('正在恢复完整原始Gaussian显示...');
+   await replaceDisplayGaussian(meta.display_url,'完整原始模型');
+   msg('已恢复原始Gaussian显示；ROI与模块三始终使用完整原始PLY。');
+   return;
+  }
+  const mul=Number(byId('clip-scale').value)/100;
+  msg(`正在准备Poisson临时过滤（${mul.toFixed(2)}×）：首次计算会较慢，后续复用距离缓存...`);
+  const response=await fetch(`/api/display-filter?multiplier=${mul.toFixed(2)}`,{cache:'no-store'});
+  const data=await response.json();
+  if(!response.ok||!data.ok)throw Error(data.error||`HTTP ${response.status}`);
+  msg(`正在加载过滤显示：${data.display_gaussians.toLocaleString()}/${data.total_gaussians.toLocaleString()} 个Gaussian...`);
+  await replaceDisplayGaussian(data.url,`Poisson ${mul.toFixed(2)}×`);
+  const caveat=data.watertight_poisson?'':'（注意：Poisson不封闭，内外符号为局部法向近似；仅供显示参考）';
+  msg(`仅显示过滤：${data.display_gaussians.toLocaleString()}/${data.total_gaussians.toLocaleString()} 个；基准长轴 ${Number(data.base_width).toFixed(5)}，当前外扩 ${Number(data.safe_width).toFixed(5)} 模型单位。${caveat}`);
+ }catch(err){
+  byId('clip-toggle').checked=false;
+  msg(`Poisson临时显示过滤未成功：${err.message}。可保持原始显示并继续圈选。`,true);
+  console.error('[roi-init] Poisson display filter:',err);
+ }finally{
+  displayFilterBusy=false;
+  byId('clip-toggle').disabled=false;
+  byId('clip-scale').disabled=false;
+ }
 }
 async function loadPoisson(){
  if(poissonPreview)return;
@@ -478,6 +592,10 @@ async function loadPoisson(){
 async function init(){
  const res=await fetch('/api/meta');if(!res.ok)throw Error(`读取输入数据失败 HTTP ${res.status}`);
  meta=await res.json();
+ const prep=meta?.module1||{};
+ const prepLabel=prep.mode==='auto' ? (prep.cached?'模块一已复用缓存':'模块一已完成SfM净化及Poisson重建') : '模块一已复用现有SfM/Poisson';
+ byId('module1-ready').textContent=prepLabel;
+ msg(prepLabel+'；请进行模块二双正交ROI圈选。');
  const sourceUp=meta?.coordinate_frame?.up_vector;
  if(!Array.isArray(sourceUp)||sourceUp.length!==3)
    throw Error('前后端方向接口不匹配：/api/meta 必须返回 coordinate_frame.up_vector[3]。请重新启动 roi-init 并按 Ctrl+Shift+R 强制刷新。');
@@ -493,6 +611,10 @@ async function init(){
   msg('发现该场景已有历史ROI，但未自动载入：本次绘图从空白开始。可使用“查看保存记录”或手动点击“载入已有ROI”。');
  }
  byId('load-existing-roi').disabled=!(meta.latest_roi||meta.canonical_roi)?.views?.length;
+ if(meta.workflow?.auto_after_confirm){
+  const existingJob=await checkWorkflow();
+  if(existingJob?.status==='running'&&!meta.workflow?.terminal_handoff)monitorWorkflow(existingJob.roi);
+ }
 
  const canvas=byId('render-canvas');
  // Official PlayCanvas WebGPU initialization: synchronous Application previously used WebGL.
@@ -527,7 +649,7 @@ async function init(){
  if(meta.workflow?.auto_after_confirm){
   byId('confirm-roi').textContent='② 确认ROI并自动生成最终PLY';
   const job=await checkWorkflow();
-  if(job?.status==='running')monitorWorkflow(job.roi);
+  if(job?.status==='running'&&!workflowTimer&&!meta.workflow?.terminal_handoff)monitorWorkflow(job.roi);
  }
 }
 init().catch(err=>{console.error(err);msg(`初始化失败：${err.message}。请检查npm install、模型路径及浏览器控制台。`,true);});

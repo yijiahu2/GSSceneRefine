@@ -382,7 +382,7 @@ def estimate_geometric_support_radius(roi, xyz, base_mask, surface_samples,
 def recover_two_stage_from_poisson(*, roi, mesh, selected_faces, gaussian_ply, positions,
                                    original_mask, diag, k_neighbors=128,
                                    trim_fraction=.05, safety_factor=1.0,
-                                   batch_size=8192):
+                                   batch_size=8192, progress_callback=None):
     """Stage A: reconstruct core from accepted Poisson triangles; stage B: full boundary band.
 
     Uses no Poisson confidence scoring, no semantic filtering, and no SDF-based
@@ -413,6 +413,7 @@ def recover_two_stage_from_poisson(*, roi, mesh, selected_faces, gaussian_ply, p
                        projection_step=max(sample_info['surface_cover_error_bound'] / 5.0,
                                            diag * 1e-6, 1e-6),
                        projection_tolerance=max(diag * 1e-5, 1e-6))
+    if progress_callback: progress_callback('safety', 'K近邻双侧5%截尾长轴与恢复后全边界隐式安全带')
     added, safety_info, _ = safety_band_after_core(
         positions=xyz, major_axes=axes, original_roi_sdf=sdf,
         original_mask=base, geometric_core_mask=core,

@@ -92,3 +92,30 @@ def test_manifest_latest_pointer_must_match_record_order(tmp_path):
 def test_empty_scene_has_no_latest(tmp_path):
     settings = InitSettings.load(prepare(tmp_path))
     assert current_latest(settings) is None
+
+
+def test_new_full_gaussian_does_not_reuse_aabb_ui_annotation(tmp_path):
+    """Same COLMAP frame still requires matching source PLY for editable ROI."""
+    from gsrefine.roi_init.results import current_latest_for_source, current_canonical_for_source
+    from gsrefine.roi_init.server import build_meta
+    config = prepare(tmp_path)
+    old = InitSettings.load(config)
+    saved = save_confirmed_roi(annotate(old), old)
+    assert current_latest_for_source(old) == Path(saved['saved_path'])
+    full = tmp_path / 'full_gaussians.ply'
+    full.write_bytes(old.gaussian_ply.read_bytes())
+    data = yaml.safe_load(config.read_text())
+    data['paths']['gaussian_ply'] = str(full)
+    data['roi_init']['gaussian_ply'] = str(full)
+    config.write_text(yaml.safe_dump(data))
+    new = InitSettings.load(config)
+    assert current_latest_for_source(new) is None
+    assert current_canonical_for_source(new) is None
+    meta = build_meta(new)
+    assert meta['latest_roi'] is None and meta['canonical_roi'] is None
+    assert current_latest(new) == Path(saved['saved_path'])
+    new_saved = save_confirmed_roi(annotate(new), new)
+    assert Path(new_saved['saved_path']).name.endswith('roi_002.json')
+    assert current_latest_for_source(new) == Path(new_saved['saved_path'])
+    assert current_canonical_for_source(new) is None
+    assert Path(saved['saved_path']).is_file()
