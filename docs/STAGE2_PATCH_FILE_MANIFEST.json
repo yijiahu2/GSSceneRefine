@@ -1,0 +1,27 @@
+{
+  "project": "GSSceneRefine",
+  "patch": "stage2-direct-sdf",
+  "base_repository": "https://github.com/yijiahu2/GSSceneRefine",
+  "base_main_commit": "9a9be5c71740c7f5d55bbf571d279a38ce390e27",
+  "installation": "unzip -o /mnt/f/Edge/GSSceneRefine_stage2.zip -d /home/xth/GSSceneRefine",
+  "unchanged_upstream_modules": [
+    "gsrefine/cleanup/__init__.py",
+    "gsrefine/roi/core.py",
+    "gsrefine/roi/finalize.py",
+    "gsrefine/roi_init/workflow.py",
+    "gsrefine/roi_init/output_layout.py",
+    "gsrefine/geometry/prepare.py",
+    "gsrefine/geometry/poisson.py",
+    "gsrefine/geometry/orientation.py"
+  ],
+  "file_sha256": {
+    "environment.yml": "539b867dadae51f7e1a916f7b76247be78b651501c364d87f55b63ade44ee8ba",
+    "run.py": "d380a70fb02338674e4cd6f45f7f2d9dd4f509a3ca6da903b57e7fbc72a7591d",
+    "gsrefine/geometry/sdf_sealing.py": "8cef804d792667633c2850a52be6dadd949c45c7257fa8ba2dd849ef97ce8a5e",
+    "gsrefine/cleanup/direct_sdf.py": "502c66fd1c6ec7c03d6a3804f6bb0ace15fe43f10e21f9c6a798f79075eaa770",
+    "gsrefine/cleanup/requirements.txt": "f7cc65c8d1041c9615285c8c321c5a140af7103e1a6dd2cdc417d10497c0778d",
+    "tests/test_stage2_cleanup.py": "db1289ba811d8230a5f1c6f72535d0fdacf62b62d4d76820023e181681aa0118",
+    "docs/STAGE2_INTEGRATION_中文.md": "1f4a4c60375133408fd7d716a074e5d0401d25a20a7e5754300aca33315a3bd4",
+    "docs/STAGE2_TECHNICAL_SCHEME_20261105.md": "608ca9ec71caadb48da9c1eb19c898fdeca5275cf780169be8ebc96afa46806a"
+  }
+}

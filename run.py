@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
-"""One command entrypoint for the entire GSSceneRefine project.
+"""One command entrypoint for the GSSceneRefine project.
 
 Usage:
-  python run.py orientation --config configs/songziguanyin.yaml --check-poisson
   python run.py roi-init --config configs/songziguanyin.yaml
-  python run.py ui --config configs/songziguanyin.yaml  # legacy/debug
+  python run.py roi-auto --config configs/songziguanyin.yaml --roi FILE --output-dir ROOT
+  python run.py stage2-cleanup --manifest ROOT/SCENE/methods/METHOD/roi_001/metadata/manifest.json
+  python run.py orientation --config configs/songziguanyin.yaml --check-poisson
+  python run.py ui --config configs/songziguanyin.yaml
   python run.py roi --config configs/songziguanyin.yaml --roi FILE.json
   python run.py scene-prepare --config configs/songziguanyin.yaml
   python run.py poisson --help
   python run.py sfm-clean --help
-  python run.py roi-auto --config configs/songziguanyin.yaml --roi FILE.json
   python run.py roi-finalize --study-dir runs/... --method R3
   python run.py roi-debug --help
   python run.py doctor --check-data
 
-This dispatches Python modules in ONE Conda environment: gsrefine.
+All modules run in ONE Conda environment: gsrefine.
 """
 from __future__ import annotations
 import runpy
 import sys
 
 COMMANDS = {
-    'ui':'gsrefine.web.server',  # legacy/debug, superseded by roi-init
+    'ui':'gsrefine.web.server',
     'roi-init':'gsrefine.roi_init.server',
     'roi-auto':'gsrefine.roi_init.workflow',
     'roi-status':'gsrefine.roi_init.status',
@@ -35,6 +36,7 @@ COMMANDS = {
     'sfm-clean':'gsrefine.geometry.sfm_clean',
     'roi-debug':'tools.make_roi_from_aabb',
     'doctor':'gsrefine.doctor',
+    'stage2-cleanup':'gsrefine.cleanup.direct_sdf',
 }
 
 def main():

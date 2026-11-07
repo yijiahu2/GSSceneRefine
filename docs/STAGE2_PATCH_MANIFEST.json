@@ -1,0 +1,42 @@
+{
+  "patch": "stage2_roi_surface_handoff",
+  "base": "post_topology_hotfix",
+  "repository": "local_only",
+  "files": [
+    {
+      "file": "gsrefine/cleanup/direct_sdf.py",
+      "sha256": "7ad59499a45b293e3ae392cbc610c7cddbfacac4b20b12aaccaf83b4946094d0",
+      "size": 34391
+    },
+    {
+      "file": "gsrefine/geometry/roi_surface.py",
+      "sha256": "f99e33ef06ef113a9e53a5b833480a0836f9f55147045e8093d27c14ecd8b6a5",
+      "size": 18329
+    },
+    {
+      "file": "gsrefine/geometry/stage1_handoff.py",
+      "sha256": "e3ae5aa07112d848a0dbacd7e4ab4282f3c17d629f8393a9663246fcfae2752a",
+      "size": 5662
+    },
+    {
+      "file": "tools/apply_stage2_handoff.py",
+      "sha256": "dc4d1379f8c8796062b4966b02cb23e84dc86c7d529ca470c09de662256510a2",
+      "size": 4985
+    },
+    {
+      "file": "tests/test_stage2_cleanup.py",
+      "sha256": "fe88dc64e7fbc59a1ecd7c893a8cf8b398783404dd86b97020f872ecc14d27dd",
+      "size": 12123
+    },
+    {
+      "file": "tests/test_stage2_stage1_writer.py",
+      "sha256": "574acaf5f58f4a6916f7e6da035c3e343f42e3a98a3506c304075a7caa52f962",
+      "size": 1942
+    },
+    {
+      "file": "docs/STAGE2_ROI_SURFACE_HANDOFF_中文.md",
+      "sha256": "22fa9c8ef99db3cef9d2caf062a3e84964a74f35f5589b38da464562c70b2cb8",
+      "size": 8947
+    }
+  ]
+}
