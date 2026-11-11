@@ -36,7 +36,8 @@ COMMANDS = {
     'sfm-clean':'gsrefine.geometry.sfm_clean',
     'roi-debug':'tools.make_roi_from_aabb',
     'doctor':'gsrefine.doctor',
-    'stage2-cleanup':'gsrefine.cleanup.direct_sdf',
+    'stage2-cleanup':'gsrefine.cleanup.direct_r3_pipeline',
+    'stage2-sfm':'gsrefine.geometry.r3_sfm_bridge',
 }
 
 def main():

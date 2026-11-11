@@ -382,7 +382,7 @@ def estimate_geometric_support_radius(roi, xyz, base_mask, surface_samples,
 def recover_two_stage_from_poisson(*, roi, mesh, selected_faces, gaussian_ply, positions,
                                    original_mask, diag, k_neighbors=128,
                                    trim_fraction=.05, safety_factor=1.0,
-                                   batch_size=8192, progress_callback=None):
+                                   batch_size=8192, progress_callback=None, stage2_handoff=None):
     """Stage A: reconstruct core from accepted Poisson triangles; stage B: full boundary band.
 
     Uses no Poisson confidence scoring, no semantic filtering, and no SDF-based
@@ -424,6 +424,18 @@ def recover_two_stage_from_poisson(*, roi, mesh, selected_faces, gaussian_ply, p
         raise AssertionError('Invalid two-stage mask containment')
     if int(final.sum()) != int(base.sum()) + int(np.count_nonzero(core & ~base)) + int(added.sum()):
         raise AssertionError('R3 final mask is not the union of two sequential additions')
+    # Query the same original post-restoration R3 field at CLEAN SfM positions.
+    # This saves geometry/radii only; it never changes the Gaussian R3 mask.
+    if stage2_handoff is not None:
+        from gsrefine.geometry.r3_sfm_bridge import save_r3_sfm_handoff
+        save_r3_sfm_handoff(
+            work_dir=stage2_handoff['work_dir'],
+            clean_sfm_npz=stage2_handoff['clean_sfm_npz'],
+            roi_json=stage2_handoff['roi_json'],
+            gaussian_ply=stage2_handoff['gaussian_ply'],
+            poisson_mesh=stage2_handoff['poisson_mesh'],
+            core_field=field, safety_config=cfg,
+            gaussian_positions=xyz, major_axes=axes)
     info = {'method': 'R3', 'algorithm': 'two_stage_poisson_core_then_knn_trimmed_implicit_band',
             'stage_A': {'core_gaussians': int(core.sum()),
                         'restored_core_gaussians': int(np.count_nonzero(core & ~base)),

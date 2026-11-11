@@ -527,7 +527,11 @@ def run(config,roi_file,output_dir, labels_file=None, *, export_ply=False,
                     diag=diag,
                     k_neighbors=int(cfg.get('guards',{}).get('safety_knn',128)),
                     trim_fraction=0.05,
-                    safety_factor=1.0, progress_callback=progress_callback)
+                    safety_factor=1.0, progress_callback=progress_callback,
+                     stage2_handoff=(dict(
+                         work_dir=out, clean_sfm_npz=sfmfile,
+                         roi_json=roi_file, gaussian_ply=plyfile,
+                         poisson_mesh=meshfile) if final_only else None))
                 two_stage_info['stage_A']['anchored_local_recovery'] = anchored_info
                 addition = float(np.count_nonzero(kept & ~basemask)) / max(1, int(basemask.sum()))
                 allowed = float(cfg['guards']['max_guard_add_fraction'])

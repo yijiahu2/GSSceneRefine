@@ -106,6 +106,7 @@ def publish(out, work, roi, config, report, *, keep_diagnostics=False):
         'roi_json': str((out/'metadata/roi.json').resolve()),
         'poisson_mesh': str(Path(paths['poisson_raw']).resolve()),
         'clean_sfm_npz': str(Path(paths['clean_sfm_npz']).resolve()),
+        'source_full_gaussian_ply': str(Path(report.get('gaussian_input_path') or paths['gaussian_ply']).resolve()),
     }
     for key in ('poisson_mesh', 'clean_sfm_npz'):
         if not Path(downstream[key]).is_file():
@@ -119,18 +120,14 @@ def publish(out, work, roi, config, report, *, keep_diagnostics=False):
     # validation. The workflow_result + manifest remain the success markers.
     shutil.copy2(roi, meta/'roi.json')
     shutil.copy2(config, meta/'effective_scene.yaml')
-    # Stage 2: exact Stage-1 R3 per-location d(x); no scalar fallback.
-    from gsrefine.geometry.roi_sfm_local import publish_stage1_exact_roi_sfm
-    _roi_sfm_path, _roi_sfm_report = publish_stage1_exact_roi_sfm(
-        downstream=downstream, metadata_dir=meta, work_dir=work)
-    if _roi_sfm_path is not None:
-        downstream['sfm_roi_npz'] = str(_roi_sfm_path)
-    # Stage 2 may reuse a certified surface mask already made in Stage 1.
-    # This is a no-op if Stage 1 did not produce the optional handoff.
-    from gsrefine.geometry.stage1_handoff import retain_stage1_surface_faces
-    _stage2_faces = retain_stage1_surface_faces(work, meta, paths['poisson_raw'], roi)
-    if _stage2_faces is not None:
-        downstream['roi_surface_faces'] = str(_stage2_faces)
+    # Publish SfM BEFORE moving the final Gaussian: bind its content hash to
+    # the existing temporary PLY, whose bytes stay identical after os.replace.
+    from gsrefine.geometry.r3_sfm_bridge import publish_stage1_r3_sfm
+    _roi_sfm_path, _roi_sfm_report = publish_stage1_r3_sfm(
+        downstream=downstream, metadata_dir=meta, work_dir=work,
+        gaussian_source_file=model)
+    # Canonical Stage-2 uses the verified R3 spatial field and the original
+    # Module-1 Poisson; no legacy triangle-face-mask handoff is generated.
     if keep_diagnostics:
         for file in list(work.iterdir()):
             if file.is_file() and file != model:
