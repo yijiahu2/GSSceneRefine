@@ -22,7 +22,7 @@ import tempfile
 
 import numpy as np
 
-VERSION = 'GSSceneRefine.roi_barrier_parity_sdf.v2'
+VERSION = 'GSSceneRefine.roi_barrier_parity_sdf.v3'
 OUTSIDE, INSIDE, UNKNOWN = 0, 1, -1
 
 
@@ -97,36 +97,36 @@ def _validate_intersection_loop(archive):
             'segment_endpoint_max_error': float(d.max())}
 
 
-def _audit_identity(audit_dir, manifest_path, inputs, r3_record, *, require_both=True):
+def _audit_identity(audit_dir, manifest_path, inputs, r3_record, *,
+                    field, wall_scene, o3d, normals, output):
     root = Path(audit_dir).expanduser().resolve(strict=True)
     report = root / 'roi_global_poisson_barrier_report.json'
     data = json.loads(report.read_text(encoding='utf-8'))
     if data.get('schema') != 'GSSceneRefine.final_R3_global_Poisson_barrier_audit.v1':
         raise ValueError('Not a verified final R3/global Poisson barrier audit')
     if data.get('status') != 'FLOOD_SAMPLING_COMPLETED_NOT_CERTIFIED_SEALED':
-        raise ValueError('Barrier audit not completed; run the complete two-resolution flood test')
+        raise ValueError('Incomplete two-resolution spatial component audit')
     inp = data['inputs']
-    required = {
-        'manifest_sha256': _sha(manifest_path),
-        'r3_sha256': _sha(r3_record),
-        'original_poisson_sha256': _sha(inputs['poisson_mesh']),
-    }
-    for k, v in required.items():
-        if inp.get(k) != v:
-            raise ValueError(f'Barrier audit source mismatch: {k}')
+    required = {'manifest_sha256': _sha(manifest_path),
+                'r3_sha256': _sha(r3_record),
+                'original_poisson_sha256': _sha(inputs['poisson_mesh'])}
+    for key, value in required.items():
+        if inp.get(key) != value:
+            raise ValueError(f'Barrier audit source mismatch: {key}')
     if str(Path(inp['final_roi_gaussian']).resolve()) != str(Path(inputs['gaussian_ply']).resolve()):
         raise ValueError('Audit Gaussian PLY is from a different ROI run')
     if data.get('r3_verified_replay', {}).get('v3_handoff_max_field_distance_error', float('inf')) > 1e-6:
         raise ValueError('R3 replay consistency check failed')
-    floods = data.get('flood', {})
-    for name in (('coarse', 'fine') if require_both else ('fine',)):
-        r = floods.get(name)
-        if not r or r['status'] != 'NO_TOP_TO_BOTTOM_PATH_SEEN_NOT_PROVEN_SEALED':
-            raise ValueError(f'Barrier flood not suitable for parity classification: {name}')
-        if r['grid']['roi_touching_audit_window_samples']:
-            raise ValueError('R3 touches truncated audit window')
     loops = _validate_intersection_loop(root / 'global_poisson_final_r3_intersection.npz')
-    return data, loops
+    from gsrefine.cleanup.barrier_separation_gate import evaluate
+    verdict = evaluate(audit_dir=root, audit_record=data, field=field,
+                       wall_scene=wall_scene, o3d=o3d, normals=normals)
+    _write_json(Path(output) / 'region_separation_gate.json', verdict)
+    if verdict['status'] != 'SUPPORTED_NUMERIC_TWO_SIDED_PARTITION_NOT_SEALED':
+        raise ValueError('R3 / original main Poisson region separation failed: '
+                         + '; '.join(verdict['blocking_reasons'])
+                         + f'. Details: {Path(output) / "region_separation_gate.json"}')
+    return data, loops, verdict
 
 
 class ParityUnionFind:
@@ -588,8 +588,11 @@ def run_roi_barrier_parity(*, manifest, preseal_report, output_dir,
             padding=.5, coarse_voxel=.30, fine_voxel=.17,
             coarse_max_cells=95000, fine_max_cells=250000,
             roi_link_samples=roi_link_samples, top_quantile=.9, only_scale='both'))
-    audit, loops = _audit_identity(report_dir, stage1, inputs, handoff)
-    _log(f'Audit accepted for sampled navigation: {loops["closed_cycles"]} closed intersection cycle(s)')
+    audit, loops, separation = _audit_identity(
+        report_dir, stage1, inputs, handoff, field=field, wall_scene=wall_scene,
+        o3d=o3d, normals=normals, output=output)
+    _log(f'Original-triangle region separation confirmed numerically: '
+         f'{loops["closed_cycles"]} closed intersection cycle(s)')
     grid_path = report_dir / 'fine_connectivity.npz'
     if not grid_path.is_file():
         raise FileNotFoundError('Verified fine connectivity NPZ is missing from barrier audit')
@@ -671,7 +674,7 @@ def run_roi_barrier_parity(*, manifest, preseal_report, output_dir,
                    'original_R3_Gaussian': str(inputs['gaussian_ply']),
                    'barrier_audit_dir': str(report_dir),
                    'source_fingerprints': identity},
-        'geometry': {'intersection_topology': loops, 'navigation': index['summary'],
+        'geometry': {'intersection_topology': loops, 'region_separation': separation, 'navigation': index['summary'],
                      'original_global_main_triangles': int(len(original_main.faces)),
                      'distance_poisson_triangles': int(len(inputs_data['main'].faces))},
         'threshold': {'sfm_p95': float(record['sfm_fit']['p95']),
@@ -721,3 +724,5 @@ def run_roi_barrier_parity(*, manifest, preseal_report, output_dir,
     return {'status': report['status'], 'report': str(output / 'roi_parity_report.json'),
             'removed': int(remove.sum()), 'kept': int(keep.sum()), 'delta': delta,
             'cleaned_ply': str(output / 'gaussian_roi_clean.ply') if report['status'] == 'CLEANED_EXPERIMENTAL_EXTERIOR_APPROVED' else None}
+
+# stage2_region_unified_original_main_v1_20261112

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-REVISION = 'global_module1_poisson_direct_r3_1x_clip_v1_20261108'
+REVISION = 'global_original_main_then_direct_r3_1x_clip_v2_20261112'
 
 
 def _sha(path):
@@ -334,6 +334,13 @@ def run(*, manifest, fit_max_points=60000,
     global_mesh, margin_fn, field_report = _restore_r3_field(
         inputs=inputs, upstream=upstream, run_dir=run_dir, audit_record=record,
         audit_samples=audit_samples)
+    # Stage 2 source order: FIRST extract original-global Poisson largest
+    # edge-connected face component; SECOND clip ONLY that original main with
+    # FINAL R3; THIRD select the largest post-clip component as the distance
+    # surface (in direct_r3_pipeline), recording all post-clip auxiliaries.
+    from tools.audit_final_r3_global_poisson_barrier import largest_original_component
+    full_global_topology = _topology(global_mesh)
+    global_mesh, original_main_info = largest_original_component(global_mesh)
     source_verts = np.asarray(global_mesh.vertices, np.float64)
     signed = np.empty(len(source_verts), dtype=np.float64)
     for a in range(0, len(source_verts), query_batch):
@@ -413,6 +420,10 @@ def run(*, manifest, fit_max_points=60000,
         'source_face_lineage': 'Each retained triangle comes from a Stage-1 global Poisson triangle; '
                                'boundary triangles are split; NO unsupported SfM face deletion.',
         'global_mesh_topology': _topology(global_mesh),
+        'original_unfiltered_global_topology': full_global_topology,
+        'original_main_selection': original_main_info,
+        'source_component_selection': 'largest_original_edge_connected_component_BEFORE_R3_clip',
+        'postclip_components_are_split_again': True,
         'candidate_topology': topology,
         'clip_counts': clip_metadata,
         'original_source_faces_used': int(len(np.unique(source_ids))),
@@ -467,3 +478,5 @@ def main(argv=None):
 
 if __name__ == '__main__':
     main()
+
+# stage2_region_unified_original_main_v1_20261112

@@ -75,7 +75,7 @@ def test_valid_original_wall_passes_even_when_old_top_bottom_flag_failed(tmp_pat
         assert info['relations'][0]['status']=='OPPOSITE_SIDE_SUPPORTED'
         assert info['relations'][0]['odd']>=8
     assert r['cross_scale']['errors']==[]
-    assert all('TOP_TO_BOTTOM_PATH_FOUND' in x for x in r['old_top_bottom_status'].values())
+    assert 'old_top_bottom_status' not in r
 
 
 def test_disconnected_grid_without_a_real_triangle_wall_is_rejected(tmp_path):
@@ -101,17 +101,22 @@ def test_original_triangle_region_xor_cycle_conflict():
     assert r['parity_conflicts']==1
 
 
-def test_auto_seed_requires_modal_top_component(tmp_path):
+def test_auto_seed_is_single_documented_exterior_hypothesis(tmp_path):
+    """Highest-shell exterior seed is a hypothesis, not a top-bottom gate."""
     from gsrefine.cleanup.roi_barrier_parity import _make_navigation
-    shape=(4,4,6); h=1.;origin=np.array([-2.,-2.,-3.])
+    shape=(4,4,6); h=1.; origin=np.array([-2.,-2.,-3.])
     passable=np.ones(shape,bool)
-    # synthetic plane z=0 with two regions
-    comp=np.zeros(shape,np.int32);comp[:,:,3:]=1
-    np.savez(tmp_path/'grid.npz',origin=origin,voxel=h,shape=np.asarray(shape),
-             passable=passable,final_r3_inside=passable,components=comp)
+    comp=np.zeros(shape,np.int32); comp[:,:,3:]=1
+    np.savez(tmp_path/'grid.npz', origin=origin, voxel=h,
+             shape=np.asarray(shape), passable=passable,
+             final_r3_inside=passable, components=comp)
     nav=_make_navigation(tmp_path/'grid.npz',lambda p:np.ones(len(p)),
                          np.array([0.,0.,1.]),Plane(),O3D,np.array([[0.,0.,1.]]),
                          neighbour_rays_batch=256)
-    assert nav['summary']['seed_info']['dominant_top_region']==1
-    assert nav['summary']['seed_info']['dominant_top_fraction']>.7
-    assert nav['summary']['odd_cycle_conflicts']==0
+    summary=nav['summary']
+    assert summary['seed_mode']=='single highest R3 shell node (researcher must verify exterior)'
+    assert summary['seed_count']==1
+    assert np.isclose(summary['seed_info']['chosen_seed_xyz'][2],2.5)
+    assert summary['odd_cycle_conflicts']==0
+
+# stage2_region_unified_original_main_v1_20261112

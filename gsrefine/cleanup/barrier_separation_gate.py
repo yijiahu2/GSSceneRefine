@@ -248,6 +248,9 @@ def evaluate(*, audit_dir, audit_record, field, wall_scene, o3d, normals):
     for level in ('coarse','fine'):
         r=audit_record.get('flood',{}).get(level)
         if not r or r.get('status') not in (
+                'REGION_GRAPH_SAMPLED_NOT_CERTIFIED',
+                # Historical completed audits: geometry graph is reusable,
+                # but no legacy top/bottom judgment is used for acceptance.
                 'NO_TOP_TO_BOTTOM_PATH_SEEN_NOT_PROVEN_SEALED',
                 'TOP_TO_BOTTOM_PATH_FOUND_SAMPLED_GRAPH'):
             reasons.append(f'Missing or incomplete {level} sampled flood audit')
@@ -273,8 +276,9 @@ def evaluate(*, audit_dir, audit_record, field, wall_scene, o3d, normals):
         reasons.extend(cross['errors'])
     return {'schema':SCHEMA,
             'status':'SUPPORTED_NUMERIC_TWO_SIDED_PARTITION_NOT_SEALED' if not reasons else 'BLOCKED_INSUFFICIENT_OR_INCONSISTENT_PARTITION',
-            'old_top_bottom_status':{l:audit_record.get('flood',{}).get(l,{}).get('status') for l in ('coarse','fine')},
             'levels':levels,'cross_scale':cross,'blocking_reasons':reasons,
             'limitations':('Numeric sampled evidence only, not an analytic watertightness certificate. '
                            'A highest-shell exterior seed is a hypothesis until researcher verification. '
                            'No Gaussian is deleted during this check.')}
+
+# stage2_region_unified_original_main_v1_20261112

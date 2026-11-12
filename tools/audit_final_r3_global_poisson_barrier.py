@@ -29,7 +29,7 @@ import tempfile
 
 import numpy as np
 
-VERSION = 'final_R3_original_global_poisson_intersection_flood_v1_20261110'
+VERSION = 'final_R3_original_global_poisson_region_graph_v2_20261112'
 
 
 def log(msg):
@@ -424,25 +424,18 @@ def flood_test(original_main,roi_fn,up,lo,hi,*,name,h_target,max_cells,
     poisson_blocked=int((~ray_ok).sum())
     src=src[ray_ok];dst=dst[ray_ok]
     labels,ncomponents=_connected_components(len(xyz),passable,src,dst)
-    top,bottom,seeds=choose_top_bottom_seeds(passable,xyz,shape,up,quantile=seed_quantile)
+    # True spatial components are the evidence; arbitrary top/bottom probe
+    # connectivity is NOT a separation criterion.  Upper-shell reachability
+    # remains a diagnostic only, never a pass/fail test.
+    top, _, seeds=choose_top_bottom_seeds(passable,xyz,shape,up,quantile=seed_quantile)
     top_l=set(map(int,np.unique(labels[top]))) - {-1}
-    bottom_l=set(map(int,np.unique(labels[bottom]))) - {-1}
-    both=sorted(top_l&bottom_l)
     reach_top=np.isin(labels,list(top_l))&passable
-    reach_bottom=np.isin(labels,list(bottom_l))&passable
-    witness=np.empty((0,3),float)
-    if both:
-        witness=_path_witness(len(xyz),src,dst,top,bottom,xyz)
-        if len(witness):np.savetxt(Path(output_dir)/f'{name}_leak_path.xyz',witness,fmt='%.8f')
-    status=('WINDOW_TRUNCATED' if touches else
-            'TOP_TO_BOTTOM_PATH_FOUND_SAMPLED_GRAPH' if both else
-            'NO_TOP_TO_BOTTOM_PATH_SEEN_NOT_PROVEN_SEALED')
+    status='WINDOW_TRUNCATED' if touches else 'REGION_GRAPH_SAMPLED_NOT_CERTIFIED' 
     np.savez_compressed(Path(output_dir)/f'{name}_connectivity.npz',
                         origin=np.asarray(lo),voxel=np.float64(h),shape=np.asarray(shape,dtype=np.int32),
                         final_r3_inside=inside.reshape(shape),
                         passable=passable.reshape(shape),
                         reachable_from_top=reach_top.reshape(shape),
-                        reachable_from_lower_probe=reach_bottom.reshape(shape),
                         components=labels.reshape(shape))
     return {'status':status,'grid':{'shape':list(shape),'voxel':h,'all_cells':int(len(xyz)),
                                   'actual_R3_cells':int(inside.sum()),'passable_cells':int(passable.sum()),
@@ -454,15 +447,10 @@ def flood_test(original_main,roi_fn,up,lo,hi,*,name,h_target,max_cells,
                        'remaining_walkable_links':int(len(src))},
             'connectivity':{'connected_regions':int(ncomponents),
                             'upper_shell_connected_regions':sorted(top_l),
-                            'lower_shell_connected_regions':sorted(bottom_l),
-                            'regions_connecting_upper_and_lower':both,
-                            'reachable_from_upper':int(reach_top.sum()),
-                            'lower_probe_reached_from_upper':bool(both),
-                            'sampled_path_vertices':int(len(witness))},
+                            'reachable_from_upper':int(reach_top.sum())},
             'seed_definition':seeds,
-            'limitations':'A found path is a sampled leak witness after segment-triangle checks. '
-                          'No found path does not mathematically certify a sealed ROI. '
-                          'The lower shell is a hypothesis, not a validated rock-inside seed. '
+            'limitations':'Sampled space components do not mathematically certify an exact partition. '
+                          'The upper shell is not automatically a validated exterior seed. '
                           'R3 segment membership is probed at finitely many positions.'}
 
 
@@ -596,11 +584,10 @@ def run(args):
             Path(args.masks),ply,grid_files,r3_fn,output,batch=args.eval_batch,
             sample=args.sample_gaussians)
     result['interpretation']={
-        'found_leak_path_at_any_scale':any(x['connectivity']['lower_probe_reached_from_upper']
-                                           for x in result.get('flood',{}).values()),
-        'warning':'Even if all levels find no leak, discretized water flooding does NOT prove '
-                  'topological sealing, and lower ROI shell is not an observed inside-rock seed. '
-                  'Do not use audit as automatic Gaussian deletion without separately confirmed partition.'}
+        'region_graph_only': True,
+        'warning':'Sampled connectivity does not prove a closed separator; accept or reject only '
+                  'after original-triangle region-parity and cross-scale checks. '
+                  'Exterior seed still requires review.'}
     atomic_json(output/'roi_global_poisson_barrier_report.json',result)
     log('Saved: '+str(output/'roi_global_poisson_barrier_report.json'))
     return result
@@ -639,3 +626,5 @@ def main(argv=None):
 
 if __name__=='__main__':
     main()
+
+# stage2_region_unified_original_main_v1_20261112

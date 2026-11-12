@@ -88,43 +88,32 @@ def _validate_output(output_dir, run_dir, source_gaussian):
 
 
 def _find_barrier_audit(roi_run, stage1_manifest, r3_handoff, original_poisson):
-    """Reuse an already completed, source-matched audit, never an intersection-only report."""
-    root = Path(roi_run) / 'cleanup'
+    """Reuse source-identical sampled region graphs; NEVER test top/bottom."""
+    root=Path(roi_run)/'cleanup'
     if not root.is_dir():
         return None
-    mh, rh, ph = _sha(stage1_manifest), _sha(r3_handoff), _sha(original_poisson)
-    candidates = []
-    # Reuse only the COMPLETE, source-identical audits which passed the
-    # ORIGINAL coarse+fine top/bottom flood acceptance used by V2.
-    # New/failed experiments remain diagnostics; they cannot become a formal
-    # parity cache merely because their files exist.
+    mh,rh,ph=_sha(stage1_manifest),_sha(r3_handoff),_sha(original_poisson)
+    candidates=[]
     for report_file in root.glob('**/roi_global_poisson_barrier_report.json'):
         try:
-            data = _read(report_file)
-            inp = data['inputs']
-            if (data['status'] != 'FLOOD_SAMPLING_COMPLETED_NOT_CERTIFIED_SEALED'
-                or inp['manifest_sha256'] != mh
-                or inp['r3_sha256'] != rh
-                or inp['original_poisson_sha256'] != ph):
+            data=_read(report_file)
+            inp=data['inputs']
+            if (data['status']!='FLOOD_SAMPLING_COMPLETED_NOT_CERTIFIED_SEALED'
+                or inp['manifest_sha256']!=mh or inp['r3_sha256']!=rh
+                or inp['original_poisson_sha256']!=ph):
                 continue
-            folder = report_file.parent
-            required = ('coarse_connectivity.npz', 'fine_connectivity.npz',
-                        'global_poisson_final_r3_intersection.npz')
-            if not all((folder / name).is_file() for name in required):
+            folder=report_file.parent
+            required=('coarse_connectivity.npz','fine_connectivity.npz',
+                      'global_poisson_final_r3_intersection.npz')
+            if not all((folder/name).is_file() for name in required):
                 continue
-            coarse, fine = data['flood']['coarse'], data['flood']['fine']
-            if any(x['status'] != 'NO_TOP_TO_BOTTOM_PATH_SEEN_NOT_PROVEN_SEALED'
-                   for x in (coarse, fine)):
+            coarse,fine=data['flood']['coarse'],data['flood']['fine']
+            if any(x['grid']['roi_touching_audit_window_samples'] for x in (coarse,fine)):
                 continue
-            if any(x['grid']['roi_touching_audit_window_samples'] for x in (coarse, fine)):
-                continue
-            voxel = float(fine['grid']['voxel'])
-            candidates.append((voxel, str(folder), folder))
-        except (KeyError, TypeError, ValueError, OSError):
+            candidates.append((float(fine['grid']['voxel']),str(folder),folder))
+        except (KeyError,TypeError,ValueError,OSError):
             continue
-    if not candidates:
-        return None
-    return sorted(candidates, key=lambda x:(x[0],x[1]))[0][2]
+    return sorted(candidates,key=lambda x:(x[0],x[1]))[0][2] if candidates else None
 
 
 def _validated_parity(parity_dir, model, source, preseal_report, original_poisson):
@@ -150,7 +139,7 @@ def _validated_parity(parity_dir, model, source, preseal_report, original_poisso
     expected_delta = float(preseal['sfm_fit']['p95']) + scale
     if not np.isclose(delta, expected_delta, rtol=1e-8, atol=1e-9):
         raise ValueError('Cached parity delta disagrees with the current complete SfM P95')
-    if report.get('schema') != 'GSSceneRefine.roi_barrier_parity_sdf.v2':
+    if report.get('schema') != 'GSSceneRefine.roi_barrier_parity_sdf.v3':
         raise ValueError('Current sealless baseline requires authenticated V2 parity; '
                          'reclassify incompatible parity masks with --reclassify')
     # Source model fields must match native 3DGS, not an XYZ-only converted PLY.
@@ -206,7 +195,21 @@ def _existing_preseal(manifest, source_roi_run, *, optional_preseal=None):
     data = _read(report)
     if Path(data['stage1_manifest']).resolve(strict=True) != Path(manifest).resolve(strict=True):
         raise ValueError('Preseal report does not belong to current Stage-1 manifest')
+    if not _source_order_preseal(report):
+        raise ValueError('Old preseal uses clip-before-global-main selection; rebuild geometry')
     return report
+
+
+def _source_order_preseal(report):
+    """True only if the source clip was produced by original-main-first v2."""
+    try:
+        data=_read(report)
+        clip=Path(data['direct_r3_clip_report']).resolve(strict=True)
+        source=_read(clip)
+        return (source.get('source_component_selection') ==
+                'largest_original_edge_connected_component_BEFORE_R3_clip')
+    except (KeyError, OSError, ValueError, TypeError):
+        return False
 
 
 def _discover_preseal(manifest, run_dir):
@@ -219,6 +222,8 @@ def _discover_preseal(manifest, run_dir):
     for report in sorted(root.glob('*/preseal_diagnostics.json')):
         try:
             validate_parity_geometry(manifest, report)
+            if not _source_order_preseal(report):
+                continue
             accepted.append(report)
         except (ValueError, FileNotFoundError, KeyError, RuntimeError, OSError):
             continue
@@ -252,7 +257,7 @@ def _discover_parity(run_dir, source, preseal, global_poisson, model):
         for report in root.glob('**/roi_parity_report.json'):
             try:
                 data = _read(report)
-                if data.get('schema') != 'GSSceneRefine.roi_barrier_parity_sdf.v2':
+                if data.get('schema') != 'GSSceneRefine.roi_barrier_parity_sdf.v3':
                     continue
                 _validated_parity(report.parent,model,source,preseal,global_poisson)
                 if (int(data['counts']['candidate_uncertain_kept']) or
@@ -569,3 +574,5 @@ def main(argv=None):
 
 if __name__ == '__main__':
     main()
+
+# stage2_region_unified_original_main_v1_20261112

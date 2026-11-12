@@ -88,6 +88,7 @@ def test_native_supersplat_fields_byte_exact(tmp_path):
 
 
 def test_reuses_source_matched_barrier_audit(tmp_path):
+    """Reuse source-identical region graphs, never old top-bottom conclusions."""
     root=tmp_path/'roi_001'
     root.mkdir()
     manifest=root/'manifest.json'; manifest.write_bytes(b'one')
@@ -101,18 +102,24 @@ def test_reuses_source_matched_barrier_audit(tmp_path):
             'inputs':{'manifest_sha256':mod._sha(manifest),
                       'r3_sha256':mod._sha(handoff),
                       'original_poisson_sha256':mod._sha(poisson)},
-            'flood':{'coarse':{'status':'NO_TOP_TO_BOTTOM_PATH_SEEN_NOT_PROVEN_SEALED',
+            'flood':{'coarse':{'status':'REGION_GRAPH_SAMPLED_NOT_CERTIFIED',
                                   'grid':{'voxel':.3,'roi_touching_audit_window_samples':0}},
-                         'fine':{'status':'NO_TOP_TO_BOTTOM_PATH_SEEN_NOT_PROVEN_SEALED',
+                     'fine':{'status':'REGION_GRAPH_SAMPLED_NOT_CERTIFIED',
                                  'grid':{'voxel':.2,'roi_touching_audit_window_samples':0}}}}
-    (folder/'roi_global_poisson_barrier_report.json').write_text(json.dumps(report))
+    report_path=folder/'roi_global_poisson_barrier_report.json'
+    report_path.write_text(json.dumps(report))
     assert mod._find_barrier_audit(root,manifest,handoff,poisson)==folder
-    # Do not reuse a COMPLETE but FAILED old two-resolution audit.
-    report['flood']['coarse']['status'] = 'TOP_TO_BOTTOM_PATH_FOUND_SAMPLED_GRAPH'
-    (folder/'roi_global_poisson_barrier_report.json').write_text(json.dumps(report))
+    # Older sampled graph status is not a rejection when source, grid and
+    # post-cache separation verification remain valid.
+    report['flood']['coarse']['status']='TOP_TO_BOTTOM_PATH_FOUND_SAMPLED_GRAPH'
+    report_path.write_text(json.dumps(report))
+    assert mod._find_barrier_audit(root,manifest,handoff,poisson)==folder
+    # Actual truncated sampling window still invalidates cache reuse.
+    report['flood']['coarse']['grid']['roi_touching_audit_window_samples']=1
+    report_path.write_text(json.dumps(report))
     assert mod._find_barrier_audit(root,manifest,handoff,poisson) is None
-    report['flood']['coarse']['status'] = 'NO_TOP_TO_BOTTOM_PATH_SEEN_NOT_PROVEN_SEALED'
-    (folder/'roi_global_poisson_barrier_report.json').write_text(json.dumps(report))
+    report['flood']['coarse']['grid']['roi_touching_audit_window_samples']=0
+    report_path.write_text(json.dumps(report))
     poisson.write_bytes(b'changed')
     assert mod._find_barrier_audit(root,manifest,handoff,poisson) is None
 
@@ -284,6 +291,7 @@ def test_parity_stage_executes_classification_only(monkeypatch,tmp_path):
 
 
 def test_geometry_preparation_reuses_validated_existing_records(monkeypatch,tmp_path):
+    """Reject old clip-before-main preseal; accept new original-main-first cache."""
     from gsrefine.cleanup import sdf_common
     run=tmp_path/'ROI';run.mkdir()
     manifest=run/'metadata/manifest.json';manifest.parent.mkdir()
@@ -294,11 +302,22 @@ def test_geometry_preparation_reuses_validated_existing_records(monkeypatch,tmp_
     monkeypatch.setattr(sdf_common,'_load_stage1_manifest',
                         lambda path:(manifest,{}, {},run))
     import types,sys
-    fake=types.ModuleType('gsrefine.cleanup.open_ab_main')
+    fake=types.ModuleType('gsrefine.cleanup.stage2_geometry_validation')
     fake.validate_parity_geometry=lambda *a,**kw:{'summary':{'status':'VALIDATED_SEALLESS_DISTANCE_GEOMETRY'}}
     monkeypatch.setitem(sys.modules,'gsrefine.cleanup.stage2_geometry_validation',fake)
+    with pytest.raises(ValueError,match='Old preseal'):
+        mod._prepare_required_geometry(manifest,run,preseal_report=preseal)
+    clip=run/'cleanup/geometry/direct_r3_clip/new/clip_comparison_report.json'
+    clip.parent.mkdir(parents=True)
+    clip.write_text(json.dumps({
+        'source_component_selection':
+        'largest_original_edge_connected_component_BEFORE_R3_clip'}))
+    preseal.write_text(json.dumps({
+        'stage1_manifest':str(manifest),
+        'direct_r3_clip_report':str(clip)}))
     selected,rec=mod._prepare_required_geometry(manifest,run,preseal_report=preseal)
-    assert selected==preseal and rec['status']=='VALIDATED_SEALLESS_DISTANCE_GEOMETRY_REUSED'
+    assert selected==preseal
+    assert rec['status']=='VALIDATED_SEALLESS_DISTANCE_GEOMETRY_REUSED'
 
 
 def test_core_aux_geometry_counts_are_dynamic(tmp_path):
