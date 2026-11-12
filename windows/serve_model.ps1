@@ -98,7 +98,7 @@ try {
           [void]$file.Seek($start,[System.IO.SeekOrigin]::Begin)
           $buffer=New-Object byte[] (1024*1024)
           while ($remaining -gt 0) {
-            $want=[int][Math]::Min($buffer.Length,$remaining)
+            $want=[int][Math]::Min([long]$buffer.Length,[long]$remaining)
             $read=$file.Read($buffer,0,$want)
             if ($read -le 0) { break }
             $stream.Write($buffer,0,$read)

@@ -95,16 +95,24 @@ def test_reuses_source_matched_barrier_audit(tmp_path):
     poisson=root/'poisson.ply'; poisson.write_bytes(b'three')
     folder=root/'cleanup/diagnostics/barrier'
     folder.mkdir(parents=True)
-    for name in ('fine_connectivity.npz','global_poisson_final_r3_intersection.npz'):
+    for name in ('coarse_connectivity.npz','fine_connectivity.npz','global_poisson_final_r3_intersection.npz'):
         (folder/name).write_bytes(b'x')
     report={'status':'FLOOD_SAMPLING_COMPLETED_NOT_CERTIFIED_SEALED',
             'inputs':{'manifest_sha256':mod._sha(manifest),
                       'r3_sha256':mod._sha(handoff),
                       'original_poisson_sha256':mod._sha(poisson)},
-            'flood':{'fine':{'status':'NO_TOP_TO_BOTTOM_PATH_SEEN_NOT_PROVEN_SEALED',
-                              'grid':{'voxel':.2,'roi_touching_audit_window_samples':0}}}}
+            'flood':{'coarse':{'status':'NO_TOP_TO_BOTTOM_PATH_SEEN_NOT_PROVEN_SEALED',
+                                  'grid':{'voxel':.3,'roi_touching_audit_window_samples':0}},
+                         'fine':{'status':'NO_TOP_TO_BOTTOM_PATH_SEEN_NOT_PROVEN_SEALED',
+                                 'grid':{'voxel':.2,'roi_touching_audit_window_samples':0}}}}
     (folder/'roi_global_poisson_barrier_report.json').write_text(json.dumps(report))
     assert mod._find_barrier_audit(root,manifest,handoff,poisson)==folder
+    # Do not reuse a COMPLETE but FAILED old two-resolution audit.
+    report['flood']['coarse']['status'] = 'TOP_TO_BOTTOM_PATH_FOUND_SAMPLED_GRAPH'
+    (folder/'roi_global_poisson_barrier_report.json').write_text(json.dumps(report))
+    assert mod._find_barrier_audit(root,manifest,handoff,poisson) is None
+    report['flood']['coarse']['status'] = 'NO_TOP_TO_BOTTOM_PATH_SEEN_NOT_PROVEN_SEALED'
+    (folder/'roi_global_poisson_barrier_report.json').write_text(json.dumps(report))
     poisson.write_bytes(b'changed')
     assert mod._find_barrier_audit(root,manifest,handoff,poisson) is None
 
@@ -287,10 +295,10 @@ def test_geometry_preparation_reuses_validated_existing_records(monkeypatch,tmp_
                         lambda path:(manifest,{}, {},run))
     import types,sys
     fake=types.ModuleType('gsrefine.cleanup.open_ab_main')
-    fake._validated_inputs=lambda *a:None
-    monkeypatch.setitem(sys.modules,'gsrefine.cleanup.open_ab_main',fake)
+    fake.validate_parity_geometry=lambda *a,**kw:{'summary':{'status':'VALIDATED_SEALLESS_DISTANCE_GEOMETRY'}}
+    monkeypatch.setitem(sys.modules,'gsrefine.cleanup.stage2_geometry_validation',fake)
     selected,rec=mod._prepare_required_geometry(manifest,run,preseal_report=preseal)
-    assert selected==preseal and rec['status']=='AUTHENTICATED_PRESEAL_REUSED'
+    assert selected==preseal and rec['status']=='VALIDATED_SEALLESS_DISTANCE_GEOMETRY_REUSED'
 
 
 def test_core_aux_geometry_counts_are_dynamic(tmp_path):

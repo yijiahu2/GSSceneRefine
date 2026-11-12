@@ -267,11 +267,15 @@ def segment_parity(scene, o3d, origins, targets, *, normals=None,
 
 
 def _prepare_geometry(manifest, preseal_report, *, config_file=None):
-    from gsrefine.cleanup.open_ab_main import _validated_inputs
+    # Formal Stage 2 is SEALLESS. Legacy single-ring cap/skirt eligibility is
+    # not a geometric prerequisite for original-Poisson parity classification.
+    from gsrefine.cleanup.stage2_geometry_validation import validate_parity_geometry
     from gsrefine.geometry.r3_direct_poisson_clip import _restore_r3_field, _source_r3_handoff
     from tools.audit_final_r3_global_poisson_barrier import largest_original_component, make_scene
-    record, main, inputs, run_dir, cfg, camera_path, _, _, preseal = _validated_inputs(
-        manifest, preseal_report, config_file=config_file)
+    checked = validate_parity_geometry(manifest, preseal_report, config_file=config_file)
+    record, main, inputs, run_dir = (checked[k] for k in ('record', 'main', 'inputs', 'run_dir'))
+    cfg, preseal = checked['config_file'], checked['report']
+    camera_path = None  # Historical seal-specific camera/winding checks disabled.
     from gsrefine.cleanup.sdf_common import _load_stage1_manifest
     stage1, upstream, original_inputs, original_run_dir = _load_stage1_manifest(manifest)
     handoff = _source_r3_handoff(Path(original_run_dir), upstream)
@@ -525,8 +529,9 @@ def _formal_export_gate(labels):
 
 
 def _export(source, mask, destination):
-    from gsrefine.cleanup.open_ab_main import _v2_export
-    return _v2_export(source, mask, destination)
+    # Source is the authenticated original GSPL GaussianPLY; preserve native
+    # binary Gaussian records, rather than importing the old Open-A+B exporter.
+    return source.export(mask, destination)
 
 
 def _check_output(output_dir, run_dir):
@@ -548,7 +553,7 @@ def run_roi_barrier_parity(*, manifest, preseal_report, output_dir,
     """Complete reusable Stage-2 experiment, with source auditing and fail-closed unknowns."""
     from gsrefine.cleanup.sdf_common import robust_gaussian_radius
     from gsrefine.roi.core import GaussianPLY
-    from gsrefine.cleanup.open_ab_main import DEFAULTS
+    from gsrefine.cleanup.stage2_geometry_validation import GAUSSIAN_DISTANCE_DEFAULTS as DEFAULTS
     from gsrefine.geometry.r3_direct_poisson_clip import _source_r3_handoff
     from gsrefine.cleanup.sdf_common import _load_stage1_manifest
     from tools.audit_final_r3_global_poisson_barrier import run as audit_run

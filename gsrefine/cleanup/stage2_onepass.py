@@ -2,7 +2,8 @@
 
 Reuses the repository's established R3 SfM, direct source-Poisson clipping,
 main/aux partition, final-R3/global-Poisson barrier audit, and exact parity
-classification. Adds unsigned distance protection from ALL local auxiliary
+classification. Historical single-ring sealing / artificial caps / Open-A+B
+are NOT in this production execution chain. Adds unsigned distance protection from ALL local auxiliary
 components before writing ONE complete, native Gaussian PLY.
 
 Run:
@@ -88,11 +89,15 @@ def _validate_output(output_dir, run_dir, source_gaussian):
 
 def _find_barrier_audit(roi_run, stage1_manifest, r3_handoff, original_poisson):
     """Reuse an already completed, source-matched audit, never an intersection-only report."""
-    root = Path(roi_run) / 'cleanup/diagnostics'
+    root = Path(roi_run) / 'cleanup'
     if not root.is_dir():
         return None
     mh, rh, ph = _sha(stage1_manifest), _sha(r3_handoff), _sha(original_poisson)
     candidates = []
+    # Reuse only the COMPLETE, source-identical audits which passed the
+    # ORIGINAL coarse+fine top/bottom flood acceptance used by V2.
+    # New/failed experiments remain diagnostics; they cannot become a formal
+    # parity cache merely because their files exist.
     for report_file in root.glob('**/roi_global_poisson_barrier_report.json'):
         try:
             data = _read(report_file)
@@ -102,12 +107,16 @@ def _find_barrier_audit(roi_run, stage1_manifest, r3_handoff, original_poisson):
                 or inp['r3_sha256'] != rh
                 or inp['original_poisson_sha256'] != ph):
                 continue
-            fine = data['flood']['fine']
-            if (fine['status'] != 'NO_TOP_TO_BOTTOM_PATH_SEEN_NOT_PROVEN_SEALED'
-                or fine['grid']['roi_touching_audit_window_samples']):
-                continue
             folder = report_file.parent
-            if not (folder/'fine_connectivity.npz').is_file() or not (folder/'global_poisson_final_r3_intersection.npz').is_file():
+            required = ('coarse_connectivity.npz', 'fine_connectivity.npz',
+                        'global_poisson_final_r3_intersection.npz')
+            if not all((folder / name).is_file() for name in required):
+                continue
+            coarse, fine = data['flood']['coarse'], data['flood']['fine']
+            if any(x['status'] != 'NO_TOP_TO_BOTTOM_PATH_SEEN_NOT_PROVEN_SEALED'
+                   for x in (coarse, fine)):
+                continue
+            if any(x['grid']['roi_touching_audit_window_samples'] for x in (coarse, fine)):
                 continue
             voxel = float(fine['grid']['voxel'])
             candidates.append((voxel, str(folder), folder))
@@ -115,8 +124,7 @@ def _find_barrier_audit(roi_run, stage1_manifest, r3_handoff, original_poisson):
             continue
     if not candidates:
         return None
-    # Prefer the finest validated sample spacing, deterministic across runs.
-    return sorted(candidates, key=lambda a:(a[0],a[1]))[0][2]
+    return sorted(candidates, key=lambda x:(x[0],x[1]))[0][2]
 
 
 def _validated_parity(parity_dir, model, source, preseal_report, original_poisson):
@@ -142,7 +150,10 @@ def _validated_parity(parity_dir, model, source, preseal_report, original_poisso
     expected_delta = float(preseal['sfm_fit']['p95']) + scale
     if not np.isclose(delta, expected_delta, rtol=1e-8, atol=1e-9):
         raise ValueError('Cached parity delta disagrees with the current complete SfM P95')
-    # Source model fields must match V2, not an XYZ point cloud converted from a PLY.
+    if report.get('schema') != 'GSSceneRefine.roi_barrier_parity_sdf.v2':
+        raise ValueError('Current sealless baseline requires authenticated V2 parity; '
+                         'reclassify incompatible parity masks with --reclassify')
+    # Source model fields must match native 3DGS, not an XYZ-only converted PLY.
     return outside, over, delta, report, report_file, mask_file
 
 
@@ -203,28 +214,42 @@ def _discover_preseal(manifest, run_dir):
     root = Path(run_dir)/'cleanup/geometry/direct_r3_sdf'
     if not root.is_dir():
         return None
-    from gsrefine.cleanup.open_ab_main import _validated_inputs
+    from gsrefine.cleanup.stage2_geometry_validation import validate_parity_geometry
     accepted=[]
     for report in sorted(root.glob('*/preseal_diagnostics.json')):
         try:
-            _validated_inputs(manifest, report)
+            validate_parity_geometry(manifest, report)
             accepted.append(report)
         except (ValueError, FileNotFoundError, KeyError, RuntimeError, OSError):
             continue
     if len(accepted)>1:
-        raise ValueError('Multiple valid preseal candidates exist; explicitly supply '
-                         '--preseal-report instead of guessing between geometry revisions')
+        # Several *identical* immutable geometry results may exist after an
+        # earlier seal experiment. Deduplicate only when the actual main/aux
+        # mesh fingerprints and full-core SfM fit are byte/number identical.
+        def identity(path):
+            data = _read(path)
+            return (data.get('main_observed_surface_sha256'),
+                    data.get('auxiliary_observed_surface_sha256'),
+                    data['sfm_fit']['p95'],
+                    data['sfm_fit']['source_core_sfm_count'],
+                    str(Path(data['stage1_manifest']).resolve()))
+        signatures={identity(p) for p in accepted}
+        if len(signatures)==1:
+            _log(f'Found {len(accepted)} equivalent authenticated geometry records; '
+                 'reusing one identical main/aux/SfM result')
+            return accepted[0]
+        raise ValueError('Several DIFFERENT authenticated main/aux/SfM geometries exist for this ROI. '
+                         'Do not guess; supply --preseal-report for a reviewed geometry version. '
+                         'Candidates: '+', '.join(str(x) for x in accepted))
     return accepted[0] if accepted else None
 
 
 def _discover_parity(run_dir, source, preseal, global_poisson, model):
-    """Reusable V2 classification is selected by provenance, never by a scene name."""
+    """Reusable proven V2 classification is selected by geometry and model provenance."""
     root = Path(run_dir)/'cleanup'
     matches=[]
-    for base in (root/'preview',root/'diagnostics'):
-        if not base.is_dir():
-            continue
-        for report in base.glob('**/roi_parity_report.json'):
+    if root.is_dir():
+        for report in root.glob('**/roi_parity_report.json'):
             try:
                 data = _read(report)
                 if data.get('schema') != 'GSSceneRefine.roi_barrier_parity_sdf.v2':
@@ -256,10 +281,11 @@ def _prepare_required_geometry(manifest, run_dir, *, preseal_report=None):
         preflight = _discover_preseal(stage1, run_dir)
     if preflight is not None:
         # This is mandatory also when the user explicitly supplies a path.
-        from gsrefine.cleanup.open_ab_main import _validated_inputs
-        _validated_inputs(stage1, preflight)
-        _log('Reusing authenticated, full-core R3 main/aux preseal: ' + str(preflight))
-        return preflight, {'status':'AUTHENTICATED_PRESEAL_REUSED'}
+        from gsrefine.cleanup.stage2_geometry_validation import validate_parity_geometry
+        checked = validate_parity_geometry(stage1, preflight)
+        _log('Reusing authenticated, full-core SEALLESS R3 main/aux geometry: ' + str(preflight))
+        return preflight, {'status':'VALIDATED_SEALLESS_DISTANCE_GEOMETRY_REUSED',
+                           'sealless_geometry_validation':checked['summary']}
     # These are the project's canonical shared caches for the current ROI run.
     # They do not write into source repository or override original Stage-1 PLY.
     from gsrefine.geometry.r3_sfm_bridge import resolve_stage2_r3_sfm
@@ -273,12 +299,18 @@ def _prepare_required_geometry(manifest, run_dir, *, preseal_report=None):
     _log('3/5 Preparing/validating main and auxiliary Poisson partition + FULL SfM P95')
     result = run_r3_check(manifest=stage1, phase='check', clip_report=str(clip_report))
     preflight = Path(result['preseal_report']).resolve(strict=True)
-    if not result.get('safeguards_passed') or not result.get('main_surface'):
-        raise RuntimeError('Main surface / complete SfM safeguard gate failed; check ' + str(preflight))
-    # The geometry barrier will be independently checked by parity.run.
-    return preflight, {'status':result['status'], 'sfm_file':str(sfm_file),
-                       'sfm_reused':bool(sfm_reused), 'clip_report':str(clip_report),
-                       'preseal':str(preflight)}
+    # Historical phase=check can return BLOCKED_PRESEAL when a complex R3
+    # produces multiple open rings. That verdict applied ONLY to artificial
+    # skirt/cap sealing. The production sealless route has its own safeguards.
+    from gsrefine.cleanup.stage2_geometry_validation import validate_parity_geometry
+    checked = validate_parity_geometry(stage1, preflight)
+    _log('Sealless geometry preflight PASSED (historic single-ring seal eligibility ignored)')
+    # The ORIGINAL global Poisson barrier is independently checked by parity.run.
+    return preflight, {'status':'VALIDATED_SEALLESS_DISTANCE_GEOMETRY',
+                       'historical_seal_trial_status':result['status'],
+                       'sealless_geometry_validation':checked['summary'],
+                       'sfm_file':str(sfm_file), 'sfm_reused':bool(sfm_reused),
+                       'clip_report':str(clip_report), 'preseal':str(preflight)}
 
 
 def _run_parity(manifest, preseal, output_dir, *, audit_dir=None,
@@ -335,6 +367,9 @@ def run(*, manifest, output_dir, preseal_report=None, barrier_audit_dir=None,
     diagnostics.mkdir()
     try:
         preseal, geometry_info = _prepare_required_geometry(stage1, run_dir, preseal_report=preseal_report)
+        # Keep the verified sealless geometry preflight when a later barrier
+        # or parity check rejects this scene (diagnostic only, never a clean PLY).
+        _atomic_json(diagnostics / 'sealless_geometry_validation.json', geometry_info)
         # After geometry generation, a previously missing R3 handoff may now exist.
         if audit_dir is None and barrier_audit_dir is None:
             from gsrefine.geometry.r3_direct_poisson_clip import _source_r3_handoff
@@ -500,7 +535,7 @@ def main(argv=None):
     p.add_argument('--parity-dir', help='Optional completed classification directory; otherwise auto classify')
     p.add_argument('--index-cache', help='Optional verified navigation cache (same R3/Poisson)')
     p.add_argument('--reclassify', action='store_true',
-                   help='Do not reuse previously validated V2 classification; recompute it for this run')
+                   help='Do not reuse existing V2 classification; recompute for this run')
     p.add_argument('--exterior-seed', nargs=3, type=float, metavar=('X','Y','Z'),
                    help='Externally verified scene outside point inside final R3')
     p.add_argument('--accept-auto-exterior', action='store_true',

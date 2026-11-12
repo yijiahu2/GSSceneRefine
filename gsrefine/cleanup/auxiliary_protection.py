@@ -13,13 +13,14 @@ import numpy as np
 
 
 def load_validated_parity(parity_dir, n_gaussians, source_gaussian):
-    """Read a completed V2 parity result and validate its counts/source/masks."""
+    """Read a completed V2/V3 parity result; formal V3-only check is in onepass."""
     parity_dir = Path(parity_dir).expanduser().resolve(strict=True)
     report_file = parity_dir/'roi_parity_report.json'
     masks_file = parity_dir/'classification_masks.npz'
     report = json.loads(report_file.read_text(encoding='utf8'))
-    if report.get('schema') != 'GSSceneRefine.roi_barrier_parity_sdf.v2':
-        raise ValueError('Expected a complete GSSceneRefine V2 parity report')
+    if report.get('schema') not in ('GSSceneRefine.roi_barrier_parity_sdf.v2',
+                                    'GSSceneRefine.roi_barrier_parity_sdf.v3'):
+        raise ValueError('Expected a complete GSSceneRefine V2/V3 parity report')
     if report.get('status') not in ('CLASSIFICATION_ONLY_PREVIEW', 'CLEANED_PLY_EXPORTED',
                                     'CLEANED_EXPERIMENTAL_EXTERIOR_APPROVED'):
         raise ValueError('Parity report was not successfully classified')
