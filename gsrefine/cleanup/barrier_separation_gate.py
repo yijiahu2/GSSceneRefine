@@ -247,15 +247,10 @@ def evaluate(*, audit_dir, audit_record, field, wall_scene, o3d, normals):
     reasons=[]; levels={}; grids={}
     for level in ('coarse','fine'):
         r=audit_record.get('flood',{}).get(level)
-        if not r or r.get('status') not in (
-                'REGION_GRAPH_SAMPLED_NOT_CERTIFIED',
-                # Historical completed audits: geometry graph is reusable,
-                # but no legacy top/bottom judgment is used for acceptance.
-                'NO_TOP_TO_BOTTOM_PATH_SEEN_NOT_PROVEN_SEALED',
-                'TOP_TO_BOTTOM_PATH_FOUND_SAMPLED_GRAPH'):
+        if not r or r.get('status') != 'REGION_GRAPH_SAMPLED_NOT_CERTIFIED':
             reasons.append(f'Missing or incomplete {level} sampled flood audit')
             continue
-        if r.get('grid',{}).get('roi_touching_audit_window_samples',1):
+        if r.get('grid',{}).get('r3_boundary_touch_count',1):
             reasons.append(f'{level} R3 touches truncated sampling window')
             continue
         p=root/(level+'_connectivity.npz')

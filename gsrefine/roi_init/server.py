@@ -322,10 +322,13 @@ def main(argv=None):
             except Exception:windows_proc.kill()
     # Module-2 preview is temporary and not required by later stages.
     shutil.rmtree(settings.out_dir / '.poisson_display_cache', ignore_errors=True)
+    completed_status = None
     if workflow.launched_job() and not interrupted:
         print('[pipeline] [2/4] ROI已保存；网页服务已关闭，后续在终端显示。',flush=True)
-        status=monitor_terminal(workflow)
-        if status['status'] != 'completed':
+        completed_status = monitor_terminal(workflow)
+        if completed_status['status'] != 'completed':
             raise SystemExit(1)
+
+    return completed_status
 
 if __name__=='__main__':main()

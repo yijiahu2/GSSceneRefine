@@ -98,14 +98,17 @@ def test_reuses_source_matched_barrier_audit(tmp_path):
     folder.mkdir(parents=True)
     for name in ('coarse_connectivity.npz','fine_connectivity.npz','global_poisson_final_r3_intersection.npz'):
         (folder/name).write_bytes(b'x')
-    report={'status':'FLOOD_SAMPLING_COMPLETED_NOT_CERTIFIED_SEALED',
+    report={'schema':'GSSceneRefine.final_R3_global_Poisson_barrier_audit.v2',
+            'version':'final_R3_original_global_poisson_region_graph_v3_window_20261112',
+            'status':'REGION_GRAPHS_COMPLETED_NUMERIC_NOT_CERTIFIED',
+            'diagnostic_window':{'window_cover':{'status':'COMPLETE_SAMPLED_WINDOW'}},
             'inputs':{'manifest_sha256':mod._sha(manifest),
                       'r3_sha256':mod._sha(handoff),
                       'original_poisson_sha256':mod._sha(poisson)},
             'flood':{'coarse':{'status':'REGION_GRAPH_SAMPLED_NOT_CERTIFIED',
-                                  'grid':{'voxel':.3,'roi_touching_audit_window_samples':0}},
+                                  'grid':{'voxel':.3,'r3_boundary_touch_count':0}},
                      'fine':{'status':'REGION_GRAPH_SAMPLED_NOT_CERTIFIED',
-                                 'grid':{'voxel':.2,'roi_touching_audit_window_samples':0}}}}
+                                 'grid':{'voxel':.2,'r3_boundary_touch_count':0}}}}
     report_path=folder/'roi_global_poisson_barrier_report.json'
     report_path.write_text(json.dumps(report))
     assert mod._find_barrier_audit(root,manifest,handoff,poisson)==folder
@@ -113,12 +116,14 @@ def test_reuses_source_matched_barrier_audit(tmp_path):
     # post-cache separation verification remain valid.
     report['flood']['coarse']['status']='TOP_TO_BOTTOM_PATH_FOUND_SAMPLED_GRAPH'
     report_path.write_text(json.dumps(report))
-    assert mod._find_barrier_audit(root,manifest,handoff,poisson)==folder
+    assert mod._find_barrier_audit(root,manifest,handoff,poisson) is None
+    report['flood']['coarse']['status']='REGION_GRAPH_SAMPLED_NOT_CERTIFIED'
+    report_path.write_text(json.dumps(report))
     # Actual truncated sampling window still invalidates cache reuse.
-    report['flood']['coarse']['grid']['roi_touching_audit_window_samples']=1
+    report['flood']['coarse']['grid']['r3_boundary_touch_count']=1
     report_path.write_text(json.dumps(report))
     assert mod._find_barrier_audit(root,manifest,handoff,poisson) is None
-    report['flood']['coarse']['grid']['roi_touching_audit_window_samples']=0
+    report['flood']['coarse']['grid']['r3_boundary_touch_count']=0
     report_path.write_text(json.dumps(report))
     poisson.write_bytes(b'changed')
     assert mod._find_barrier_audit(root,manifest,handoff,poisson) is None

@@ -88,7 +88,7 @@ def _validate_output(output_dir, run_dir, source_gaussian):
 
 
 def _find_barrier_audit(roi_run, stage1_manifest, r3_handoff, original_poisson):
-    """Reuse source-identical sampled region graphs; NEVER test top/bottom."""
+    """Reuse only source-identical V3 bounded two-resolution region graphs."""
     root=Path(roi_run)/'cleanup'
     if not root.is_dir():
         return None
@@ -98,7 +98,10 @@ def _find_barrier_audit(roi_run, stage1_manifest, r3_handoff, original_poisson):
         try:
             data=_read(report_file)
             inp=data['inputs']
-            if (data['status']!='FLOOD_SAMPLING_COMPLETED_NOT_CERTIFIED_SEALED'
+            if (data.get('schema')!='GSSceneRefine.final_R3_global_Poisson_barrier_audit.v2'
+                or data.get('version')!='final_R3_original_global_poisson_region_graph_v3_window_20261112'
+                or data.get('status')!='REGION_GRAPHS_COMPLETED_NUMERIC_NOT_CERTIFIED'
+                or data.get('diagnostic_window',{}).get('window_cover',{}).get('status')!='COMPLETE_SAMPLED_WINDOW'
                 or inp['manifest_sha256']!=mh or inp['r3_sha256']!=rh
                 or inp['original_poisson_sha256']!=ph):
                 continue
@@ -108,7 +111,10 @@ def _find_barrier_audit(roi_run, stage1_manifest, r3_handoff, original_poisson):
             if not all((folder/name).is_file() for name in required):
                 continue
             coarse,fine=data['flood']['coarse'],data['flood']['fine']
-            if any(x['grid']['roi_touching_audit_window_samples'] for x in (coarse,fine)):
+            if any(level.get('status') != 'REGION_GRAPH_SAMPLED_NOT_CERTIFIED'
+                   for level in (coarse, fine)):
+                continue
+            if any(x['grid']['r3_boundary_touch_count'] for x in (coarse,fine)):
                 continue
             candidates.append((float(fine['grid']['voxel']),str(folder),folder))
         except (KeyError,TypeError,ValueError,OSError):

@@ -102,10 +102,14 @@ def _audit_identity(audit_dir, manifest_path, inputs, r3_record, *,
     root = Path(audit_dir).expanduser().resolve(strict=True)
     report = root / 'roi_global_poisson_barrier_report.json'
     data = json.loads(report.read_text(encoding='utf-8'))
-    if data.get('schema') != 'GSSceneRefine.final_R3_global_Poisson_barrier_audit.v1':
+    if data.get('schema') != 'GSSceneRefine.final_R3_global_Poisson_barrier_audit.v2':
         raise ValueError('Not a verified final R3/global Poisson barrier audit')
-    if data.get('status') != 'FLOOD_SAMPLING_COMPLETED_NOT_CERTIFIED_SEALED':
+    if data.get('status') != 'REGION_GRAPHS_COMPLETED_NUMERIC_NOT_CERTIFIED':
         raise ValueError('Incomplete two-resolution spatial component audit')
+    if data.get('version') != 'final_R3_original_global_poisson_region_graph_v3_window_20261112':
+        raise ValueError('Old sampling audit version; regenerate both spatial grids')
+    if data.get('diagnostic_window', {}).get('window_cover', {}).get('status') != 'COMPLETE_SAMPLED_WINDOW':
+        raise ValueError('R3 sampling window has not passed the new coverage check')
     inp = data['inputs']
     required = {'manifest_sha256': _sha(manifest_path),
                 'r3_sha256': _sha(r3_record),
@@ -312,6 +316,7 @@ def _navigation_identity(audit_report, grid_path, *, roi_link_samples=3):
     """
     return {
         'schema': VERSION,
+        'audit_version': audit_report.get('version','unversioned'),
         'audit_manifest_sha256': audit_report['inputs']['manifest_sha256'],
         'r3_sha256': audit_report['inputs']['r3_sha256'],
         'global_poisson_sha256': audit_report['inputs']['original_poisson_sha256'],
@@ -587,7 +592,9 @@ def run_roi_barrier_parity(*, manifest, preseal_report, output_dir,
             edge_zero_epsilon=1e-6, same_sign_samples=4000, eval_batch=2048,
             padding=.5, coarse_voxel=.30, fine_voxel=.17,
             coarse_max_cells=95000, fine_max_cells=250000,
-            roi_link_samples=roi_link_samples, top_quantile=.9, only_scale='both'))
+            roi_link_samples=roi_link_samples, top_quantile=.9, only_scale='both',
+            window_max_rounds=12,window_growth_voxels=3.0,
+            window_max_voxel_scale=1.25))
     audit, loops, separation = _audit_identity(
         report_dir, stage1, inputs, handoff, field=field, wall_scene=wall_scene,
         o3d=o3d, normals=normals, output=output)

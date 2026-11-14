@@ -22,7 +22,10 @@ def test_original_main_selected_before_clip_and_postclip_main_preserved():
 
 def test_no_top_bottom_flood_verdict_generated():
     s=(ROOT/'tools/audit_final_r3_global_poisson_barrier.py').read_text()
-    assert "status='WINDOW_TRUNCATED' if touches else 'REGION_GRAPH_SAMPLED_NOT_CERTIFIED'" in s
+    assert "status='REGION_GRAPH_SAMPLED_NOT_CERTIFIED'" in s
+    assert 'def complete_window_for_levels' in s
+    assert 'BLOCKED_INCOMPLETE_SAMPLING_WINDOW' in s
+    assert "'r3_boundary_touch_count':touches" in s
     assert 'bottom_l=set(map(int,np.unique(labels[bottom])))' not in s
 
 

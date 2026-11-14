@@ -29,7 +29,7 @@ import tempfile
 
 import numpy as np
 
-VERSION = 'final_R3_original_global_poisson_region_graph_v2_20261112'
+VERSION = 'final_R3_original_global_poisson_region_graph_v3_window_20261112'
 
 
 def log(msg):
@@ -273,6 +273,111 @@ def bounding_window(initial_roi, r3_gaussian_xyz, padding):
                         'note':'AABB is only a sample-window; actual R3 membership comes from the verified continuous field'}
 
 
+
+
+# Stage-2 audit-window implementation V3. The installer embeds this code directly
+# into tools/audit_final_r3_global_poisson_barrier.py; this file is not imported.
+
+def _r3_shell_probe(field, lo, hi, *, target_voxel, max_cells, batch=2048):
+    """Check exactly the outermost voxel centres of the production grid.
+
+    Counts touch points once per unique shell centre.  Per-side counts may
+    overlap at edges/corners; this is intentional and is not a Gaussian mask.
+    """
+    low=np.asarray(lo, dtype=np.float64)
+    high=np.asarray(hi, dtype=np.float64)
+    h, shape=grid_spec(low,high,target_voxel,max_cells)
+    shape=tuple(int(n) for n in shape)
+    boundary=np.zeros(shape,dtype=bool)
+    boundary[0,:,:]=True;boundary[-1,:,:]=True
+    boundary[:,0,:]=True;boundary[:,-1,:]=True
+    boundary[:,:,0]=True;boundary[:,:,-1]=True
+    ijk=np.argwhere(boundary)
+    xyz=low+(ijk.astype(np.float64)+0.5)*h
+    inside=eval_r3(field,xyz,batch=batch)>0
+    hits=ijk[inside]
+    sides={}
+    for axis,letter in enumerate('xyz'):
+        sides[letter+'_min']=int(np.count_nonzero(hits[:,axis]==0))
+        sides[letter+'_max']=int(np.count_nonzero(hits[:,axis]==shape[axis]-1))
+    return {'voxel':float(h),'shape':list(shape),
+            'shell_nodes_checked':int(len(ijk)),
+            'r3_boundary_touch_count':int(inside.sum()),'touches_by_side':sides}
+
+
+def complete_window_for_levels(field, lo, hi, *, levels, batch=2048,
+                               max_rounds=12, growth_voxels=3.0,
+                               max_voxel_scale=1.25, logger=None):
+    """Expand only the *numerical* AABB, preserving ROI and Poisson inputs.
+
+    Both levels share the same final AABB. Normal cases retain bit-identical
+    bounds. A grid cap may enlarge actual voxel size: prevent >25% upsampling
+    deterioration relative to the original scene-specific grid specification.
+    Fail closed if the window is unresolved within the expansion budget.
+    """
+    lower=np.asarray(lo,dtype=np.float64).copy()
+    upper=np.asarray(hi,dtype=np.float64).copy()
+    if (lower.shape!=(3,) or upper.shape!=(3,) or
+            not np.isfinite(lower).all() or not np.isfinite(upper).all() or
+            not np.all(upper>lower)):
+        raise ValueError('Invalid initial 3D sampling bounds')
+    if not levels or len({str(x[0]) for x in levels})!=len(levels):
+        raise ValueError('Sampling levels must be nonempty and uniquely named')
+    if not (1<=int(max_rounds)<=64 and 1.0<=float(growth_voxels)<=12.0
+            and 1.0<=float(max_voxel_scale)<=2.0):
+        raise ValueError('Invalid sampling-window expansion safeguards')
+    initial_lower=lower.copy();initial_upper=upper.copy()
+    base={name:grid_spec(lower,upper,float(h),int(cap))[0]
+          for name,h,cap in levels}
+    trace=[]
+    for step in range(int(max_rounds)+1):
+        grow_lo=np.zeros(3,dtype=np.float64)
+        grow_hi=np.zeros(3,dtype=np.float64)
+        results={}
+        for name,target,cap in levels:
+            info=_r3_shell_probe(field,lower,upper,target_voxel=float(target),
+                                  max_cells=int(cap),batch=batch)
+            h=float(info['voxel'])
+            if h>base[name]*float(max_voxel_scale)+1e-10:
+                raise RuntimeError(
+                    f'{name} grid resolution would degrade from {base[name]:.6g} to '
+                    f'{h:.6g} (> {max_voxel_scale:.3g}x). Increase max_cells '
+                    'instead of silently weakening spatial validation.')
+            results[name]=info
+            for axis,letter in enumerate('xyz'):
+                if info['touches_by_side'][letter+'_min']:
+                    grow_lo[axis]=max(grow_lo[axis],float(growth_voxels)*h)
+                if info['touches_by_side'][letter+'_max']:
+                    grow_hi[axis]=max(grow_hi[axis],float(growth_voxels)*h)
+        touched=sum(x['r3_boundary_touch_count'] for x in results.values())
+        trace.append({'attempt':step+1,'low':lower.tolist(),
+                      'high':upper.tolist(),'levels':results,'total_touches':touched})
+        if logger:
+            logger('3D sampling window: '+', '.join(
+                f'{name} boundary-R3={results[name]["r3_boundary_touch_count"]}'
+                f' (h={results[name]["voxel"]:.6f})'
+                for name,_,_ in levels)+f'; expansion round={step}')
+        if touched==0:
+            return lower,upper,{
+                'schema':'GSSceneRefine.window_cover.v3',
+                'status':'COMPLETE_SAMPLED_WINDOW',
+                'expanded':bool(step),'expansion_rounds':int(step),
+                'initial_low':initial_lower.tolist(),
+                'initial_high':initial_upper.tolist(),
+                'final_low':lower.tolist(),'final_high':upper.tolist(),
+                'initial_voxel_sizes':{k:float(v) for k,v in base.items()},
+                'levels':results,'trace':trace,
+                'scope':'Numerical sampling box only; R3 and Poisson unchanged',
+                'limitation':'Zero sampled shell contacts is not an analytic proof of full ROI coverage.'}
+        if step==int(max_rounds):
+            raise RuntimeError(
+                f'R3 still touches the sampling box after {max_rounds} expansions: '
+                +str({name:info['touches_by_side'] for name,info in results.items()}))
+        lower-=grow_lo;upper+=grow_hi
+        if not np.isfinite(lower).all() or not np.isfinite(upper).all():
+            raise RuntimeError('Sampling window expanded to nonfinite values')
+
+
 def grid_spec(lo,hi,desired,max_cells):
     ext=np.asarray(hi)-np.asarray(lo)
     if np.any(ext<=0) or desired<=0 or max_cells<200:
@@ -405,6 +510,9 @@ def flood_test(original_main,roi_fn,up,lo,hi,*,name,h_target,max_cells,
     # Fail open/nonconclusive when R3 ROI touches artificial audit window.
     v=inside.reshape(shape)
     touches=int(v[0].sum()+v[-1].sum()+v[:,0].sum()+v[:,-1].sum()+v[:,:,0].sum()+v[:,:,-1].sum())
+    if touches:
+        raise RuntimeError(f'{name} sampled box still intersects R3 at {touches} outer nodes; '
+                           'refuse to construct an incomplete region graph')
     scene,o3d=make_scene(original_main)
     # Only a NUMERICAL touching exclusion; never old 1.25*h / 2*h
     # over-wide Gaussian deletion protection band.
@@ -430,7 +538,7 @@ def flood_test(original_main,roi_fn,up,lo,hi,*,name,h_target,max_cells,
     top, _, seeds=choose_top_bottom_seeds(passable,xyz,shape,up,quantile=seed_quantile)
     top_l=set(map(int,np.unique(labels[top]))) - {-1}
     reach_top=np.isin(labels,list(top_l))&passable
-    status='WINDOW_TRUNCATED' if touches else 'REGION_GRAPH_SAMPLED_NOT_CERTIFIED' 
+    status='REGION_GRAPH_SAMPLED_NOT_CERTIFIED'
     np.savez_compressed(Path(output_dir)/f'{name}_connectivity.npz',
                         origin=np.asarray(lo),voxel=np.float64(h),shape=np.asarray(shape,dtype=np.int32),
                         final_r3_inside=inside.reshape(shape),
@@ -440,7 +548,7 @@ def flood_test(original_main,roi_fn,up,lo,hi,*,name,h_target,max_cells,
     return {'status':status,'grid':{'shape':list(shape),'voxel':h,'all_cells':int(len(xyz)),
                                   'actual_R3_cells':int(inside.sum()),'passable_cells':int(passable.sum()),
                                   'near_original_mesh_numeric_excluded':int((inside&~passable).sum()),
-                                  'roi_touching_audit_window_samples':touches},
+                                  'r3_boundary_touch_count':touches},
             'barrier':{'candidate_neighbour_links':int(before),
                        'links_rejected_by_actual_R3_field_samples':int(r3_rejected),
                        'original_global_poisson_triangle_blocked_links':poisson_blocked,
@@ -534,7 +642,7 @@ def run(args):
         audit_record=record,audit_samples=args.audit_samples)
     log('Original global Poisson recovered; selecting ORIGINAL largest connected component ...')
     original_main,sel=largest_original_component(orig_global)
-    result={'schema':'GSSceneRefine.final_R3_global_Poisson_barrier_audit.v1',
+    result={'schema':'GSSceneRefine.final_R3_global_Poisson_barrier_audit.v2',
             'version':VERSION,'created_utc':datetime.now(timezone.utc).isoformat(),
             'status':'IN_PROGRESS_READ_ONLY_GEOMETRY_DIAGNOSTIC',
             'inputs':{'manifest':str(mf),'manifest_sha256':sha256_file(mf),
@@ -560,7 +668,26 @@ def run(args):
     ply=GaussianPLY(inputs['gaussian_ply'])
     initial=ROI.from_file(inputs['roi_json'])
     lo,hi,window=bounding_window(initial,ply.positions(),args.padding)
-    result['diagnostic_window']={'low':lo,'high':hi,**window}
+    planned_levels=[('coarse',args.coarse_voxel,args.coarse_max_cells),
+                    ('fine',args.fine_voxel,args.fine_max_cells)]
+    planned_levels=[x for x in planned_levels if args.only_scale in (x[0],'both')]
+    initial_window_low=lo.tolist(); initial_window_high=hi.tolist()
+    try:
+        lo,hi,window_fit=complete_window_for_levels(
+            r3_fn,lo,hi,levels=planned_levels,batch=args.eval_batch,
+            max_rounds=getattr(args,'window_max_rounds',12),
+            growth_voxels=getattr(args,'window_growth_voxels',3.0),
+            max_voxel_scale=getattr(args,'window_max_voxel_scale',1.25),logger=log)
+    except Exception as exc:
+        result['status']='BLOCKED_INCOMPLETE_SAMPLING_WINDOW'
+        result['diagnostic_window']={**window,
+            'initial_low':initial_window_low,'initial_high':initial_window_high,
+            'status':'BLOCKED_WINDOW_CHECK','error':type(exc).__name__+': '+str(exc)}
+        atomic_json(output/'roi_global_poisson_barrier_report.json',result)
+        raise
+    result['diagnostic_window']={'low':lo.tolist(),'high':hi.tolist(),
+                                  **window,'window_cover':window_fit}
+    atomic_json(output/'roi_global_poisson_barrier_report.json',result)
     for name,desired,cap in [('coarse',args.coarse_voxel,args.coarse_max_cells),
                              ('fine',args.fine_voxel,args.fine_max_cells)]:
         if args.only_scale not in (name,'both'):continue
@@ -577,7 +704,7 @@ def run(args):
             result.setdefault('errors',{})[name]=type(e).__name__+': '+str(e)
             atomic_json(output/'roi_global_poisson_barrier_report.json',result)
             raise
-    result['status']='FLOOD_SAMPLING_COMPLETED_NOT_CERTIFIED_SEALED'
+    result['status']='REGION_GRAPHS_COMPLETED_NUMERIC_NOT_CERTIFIED'
     if args.masks:
         grid_files={name:output/f'{name}_connectivity.npz' for name in result.get('flood',{})}
         result['gaussian_sample_comparison']=_sample_gaussian_comparison(
@@ -614,6 +741,9 @@ def main(argv=None):
     p.add_argument('--roi-link-samples',type=int,default=3)
     p.add_argument('--top-quantile',type=float,default=.90)
     p.add_argument('--only-scale',choices=['both','coarse','fine'],default='both')
+    p.add_argument('--window-max-rounds',type=int,default=12)
+    p.add_argument('--window-growth-voxels',type=float,default=3.0)
+    p.add_argument('--window-max-voxel-scale',type=float,default=1.25)
     a=p.parse_args(argv)
     if a.root_iterations<8 or a.root_iterations>45:p.error('--root-iterations 8..45')
     if a.eval_batch<32:p.error('--eval-batch >=32')

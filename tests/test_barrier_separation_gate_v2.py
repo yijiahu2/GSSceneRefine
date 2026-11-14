@@ -52,8 +52,8 @@ def fixture(tmp_path):
                  origin=np.array([-4.,-4.,-4.]),voxel=h,
                  shape=np.array(shape,np.int32), final_r3_inside=passing,
                  passable=passing,components=comp)
-        details[label]={'status':'TOP_TO_BOTTOM_PATH_FOUND_SAMPLED_GRAPH',
-                        'grid':{'shape':list(shape),'voxel':h,'roi_touching_audit_window_samples':0}}
+        details[label]={'status':'REGION_GRAPH_SAMPLED_NOT_CERTIFIED',
+                        'grid':{'shape':list(shape),'voxel':h,'r3_boundary_touch_count':0}}
     return {'flood':details}
 
 
