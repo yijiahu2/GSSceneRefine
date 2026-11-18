@@ -694,6 +694,10 @@ def run_roi_barrier_parity(*, manifest, preseal_report, output_dir,
                    'candidate_inside_kept': int(np.sum(candidate & (occupancy == INSIDE))),
                    'candidate_uncertain_kept': int(np.sum(candidate & (occupancy == UNKNOWN))),
                    'all_kept': int(keep.sum())},
+        'classification_config': {'nearest_k': int(nearest_k),
+                                  'min_path_agree': int(min_agree),
+                                  'roi_link_samples': int(roi_link_samples),
+                                  'seed_mode': str(index['summary'].get('seed_mode', 'unknown'))},
         'short_ray': diagnostics,
         'limitations': 'ROI Poisson barrier is NUMERICALLY audited, not mathematically watertight-certified. '
                        'Top-shell exterior requires scene verification. An unresolved query BLOCKS formal export.',
@@ -733,3 +737,5 @@ def run_roi_barrier_parity(*, manifest, preseal_report, output_dir,
             'cleaned_ply': str(output / 'gaussian_roi_clean.ply') if report['status'] == 'CLEANED_EXPERIMENTAL_EXTERIOR_APPROVED' else None}
 
 # stage2_region_unified_original_main_v1_20261112
+
+# gsrefine_engineering_manifest_resume_v1_20261114

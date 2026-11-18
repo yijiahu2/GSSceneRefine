@@ -312,6 +312,11 @@ class WorkflowManager:
             job = dict(self._job) if self._job is not None else None
         if job is None:
             job = self._recent()
+            if job is not None:
+                previous = _read_progress(job['output_dir'])
+                if (previous.get('status') != 'running' or
+                        not _pid_alive(previous.get('pid'))):
+                    return {'enabled': self.enabled, 'status': 'idle'}
         if job is None:
             return {'enabled': self.enabled, 'status': 'idle'}
         out, roi, sha = job['output_dir'], job['roi'], job['roi_sha256']
@@ -344,7 +349,8 @@ class WorkflowManager:
                           phase_label=PHASES['failed'][1],
                           error=(f'Worker exited with code {rc}; inspect workflow.log' if rc is not None
                                  else 'Interrupted or missing worker; inspect workflow.log'))
-        if announce and result['status'] != 'running':
+        # A historic recovered run must not announce itself as THIS session's job.
+        if announce and self.launched_job() and result['status'] != 'running':
             key = (sha, result['status'], result.get('final_ply'))
             with self._lock:
                 if key != self._last_announced:
@@ -477,3 +483,5 @@ def main(argv=None):
 
 if __name__ == '__main__':
     main()
+
+# gsrefine_engineering_manifest_resume_v1_20261114

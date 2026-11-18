@@ -122,7 +122,8 @@ def _find_barrier_audit(roi_run, stage1_manifest, r3_handoff, original_poisson):
     return sorted(candidates,key=lambda x:(x[0],x[1]))[0][2] if candidates else None
 
 
-def _validated_parity(parity_dir, model, source, preseal_report, original_poisson):
+def _validated_parity(parity_dir, model, source, preseal_report, original_poisson, *,
+                      nearest_k=None, min_path_agree=None):
     """Do not combine a spatial result from another ROI / Poisson / Gaussian method."""
     from gsrefine.cleanup.auxiliary_protection import load_validated_parity
     parity_dir = Path(parity_dir).resolve(strict=True)
@@ -148,6 +149,13 @@ def _validated_parity(parity_dir, model, source, preseal_report, original_poisso
     if report.get('schema') != 'GSSceneRefine.roi_barrier_parity_sdf.v3':
         raise ValueError('Current sealless baseline requires authenticated V2 parity; '
                          'reclassify incompatible parity masks with --reclassify')
+    # Classification cache reuse is safe only for matching numeric query parameters.
+    if nearest_k is not None or min_path_agree is not None:
+        config = report.get('classification_config') or {}
+        if (config.get('nearest_k') != int(nearest_k) or
+                config.get('min_path_agree') != int(min_path_agree) or
+                config.get('roi_link_samples') != 3):
+            raise ValueError('Parity cache uses different/unknown classification settings; recompute')
     # Source model fields must match native 3DGS, not an XYZ-only converted PLY.
     return outside, over, delta, report, report_file, mask_file
 
@@ -255,7 +263,7 @@ def _discover_preseal(manifest, run_dir):
     return accepted[0] if accepted else None
 
 
-def _discover_parity(run_dir, source, preseal, global_poisson, model):
+def _discover_parity(run_dir, source, preseal, global_poisson, model, *, nearest_k=8, min_path_agree=2):
     """Reusable proven V2 classification is selected by geometry and model provenance."""
     root = Path(run_dir)/'cleanup'
     matches=[]
@@ -265,7 +273,11 @@ def _discover_parity(run_dir, source, preseal, global_poisson, model):
                 data = _read(report)
                 if data.get('schema') != 'GSSceneRefine.roi_barrier_parity_sdf.v3':
                     continue
-                _validated_parity(report.parent,model,source,preseal,global_poisson)
+                _validated_parity(report.parent,model,source,preseal,global_poisson,
+                                  nearest_k=nearest_k,min_path_agree=min_path_agree)
+                if data.get('classification_config',{}).get('seed_mode') != (
+                        'single highest R3 shell node (researcher must verify exterior)'):
+                    continue
                 if (int(data['counts']['candidate_uncertain_kept']) or
                     int(data['geometry']['navigation']['conflicting_roots']) or
                     int(data['short_ray']['conflicting_paths'])):
@@ -389,7 +401,8 @@ def run(*, manifest, output_dir, preseal_report=None, barrier_audit_dir=None,
         model = GaussianPLY(inputs['gaussian_ply'])
         if parity_dir is None and not reclassify and exterior_seed is None:
             parity_dir = _discover_parity(run_dir, inputs['gaussian_ply'], preseal,
-                                          inputs['poisson_mesh'], model)
+                                          inputs['poisson_mesh'], model,
+                                          nearest_k=nearest_k, min_path_agree=min_path_agree)
         parity_path = Path(parity_dir).expanduser().resolve(strict=True) if parity_dir else diagnostics/'parity'
         if parity_dir is None:
             _run_parity(stage1, preseal, parity_path, audit_dir=audit_dir,
@@ -399,7 +412,8 @@ def run(*, manifest, output_dir, preseal_report=None, barrier_audit_dir=None,
         else:
             _log('4/5 Reusing source-checked parity classification: ' + str(parity_path))
         outside, over, delta, parity_record, report_file, masks_file = _validated_parity(
-            parity_path, model, inputs['gaussian_ply'], preseal, inputs['poisson_mesh'])
+            parity_path, model, inputs['gaussian_ply'], preseal, inputs['poisson_mesh'],
+            nearest_k=nearest_k, min_path_agree=min_path_agree)
         nav = parity_record.get('geometry',{}).get('navigation',{})
         if int(nav.get('known_outside_nodes',0)) == 0 or int(nav.get('known_inside_nodes',0)) == 0:
             raise RuntimeError('Parity classification has no two-sided partition')
@@ -582,3 +596,5 @@ if __name__ == '__main__':
     main()
 
 # stage2_region_unified_original_main_v1_20261112
+
+# gsrefine_engineering_manifest_resume_v1_20261114

@@ -103,7 +103,7 @@ def publish(out, work, roi, config, report, *, keep_diagnostics=False):
     paths = (yaml.safe_load(config.read_text(encoding='utf8')) or {}).get('paths', {})
     downstream = {
         'gaussian_ply': str(dest.resolve()),
-        'roi_json': str((out/'metadata/roi.json').resolve()),
+        'roi_json': str(roi.resolve(strict=True)),
         'poisson_mesh': str(Path(paths['poisson_raw']).resolve()),
         'clean_sfm_npz': str(Path(paths['clean_sfm_npz']).resolve()),
         'source_full_gaussian_ply': str(Path(report.get('gaussian_input_path') or paths['gaussian_ply']).resolve()),
@@ -113,12 +113,15 @@ def publish(out, work, roi, config, report, *, keep_diagnostics=False):
             raise RuntimeError(f'Missing required downstream input before PLY publication: {key}')
     if not roi.is_file() or not config.is_file():
         raise RuntimeError('Cannot publish without source ROI JSON and effective config')
+    from gsrefine.roi.core import file_sha256
+    if file_sha256(roi) != report['input_sha256']['roi']:
+        raise ValueError('Confirmed canonical ROI changed during Stage-1 processing')
     dest.parent.mkdir(parents=True, exist_ok=True)
     meta = out / 'metadata'
     meta.mkdir(parents=True, exist_ok=True)
     # Copy small records first; a final model is visible only after study
     # validation. The workflow_result + manifest remain the success markers.
-    shutil.copy2(roi, meta/'roi.json')
+    # One canonical immutable scene/roi/roi_NNN.json; never copy it into metadata.
     shutil.copy2(config, meta/'effective_scene.yaml')
     # Publish SfM BEFORE moving the final Gaussian: bind its content hash to
     # the existing temporary PLY, whose bytes stay identical after os.replace.
@@ -158,3 +161,5 @@ def publish(out, work, roi, config, report, *, keep_diagnostics=False):
             raise RuntimeError(f'Missing required downstream input: {key}')
     write_atomic(meta/'manifest.json', manifest)
     return dest.resolve(), manifest, summary
+
+# gsrefine_engineering_manifest_resume_v1_20261114

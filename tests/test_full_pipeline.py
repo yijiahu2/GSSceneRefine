@@ -21,6 +21,7 @@ def args(tmp_path):
 
 
 def successful_stage1(tmp_path):
+    from gsrefine.roi.core import file_sha256
     roi_run = tmp_path / 'results' / 'biechuanchansi' / 'methods' / 'Mip-Splatting' / 'roi_002'
     (roi_run / 'final').mkdir(parents=True)
     (roi_run / 'metadata').mkdir()
@@ -29,11 +30,23 @@ def successful_stage1(tmp_path):
     roi_path.write_text('{}')
     ply = roi_run / 'final' / 'gaussian_roi.ply'
     ply.write_bytes(b'ply\nDATA')
+    poisson = tmp_path/'results'/'biechuanchansi'/'geometry'/'poisson_surface.ply'
+    poisson.parent.mkdir(parents=True,exist_ok=True)
+    poisson.write_bytes(b'poisson')
+    sfm = poisson.parent / 'cleaned_sfm.npz'
+    sfm.write_bytes(b'sfm')
     (roi_run / 'metadata' / 'manifest.json').write_text(json.dumps({
+        'schema': 'GSSceneRefine.output.v3',
         'status': 'completed',
-        'stage2_inputs': {'roi_json': str(roi_path), 'gaussian_ply': str(ply)}}))
+        'result_status': 'ROI_RESTORED_NOT_ANOMALY_CLEANED',
+        'input_sha256': {'roi': file_sha256(roi_path),
+                         'poisson': file_sha256(poisson), 'sfm': file_sha256(sfm)},
+        'output_sha256': file_sha256(ply),
+        'stage2_inputs': {'roi_json': str(roi_path), 'gaussian_ply': str(ply),
+                          'poisson_mesh': str(poisson), 'clean_sfm_npz': str(sfm)}}))
     return {'status': 'completed', 'output_dir': str(roi_run),
-            'roi': str(roi_path), 'final_ply': str(ply)}, roi_run
+            'roi': str(roi_path), 'roi_sha256': file_sha256(roi_path),
+            'final_ply': str(ply)}, roi_run
 
 
 def fake_modules(monkeypatch, stage1_status):
@@ -59,9 +72,19 @@ def test_integrated_run_selects_exact_completed_roi_and_stage2(monkeypatch, tmp_
         assert check is False
         commands.append(cmd)
         out = Path(cmd[cmd.index('--output-dir') + 1])
-        (out / 'gaussian_roi_clean.ply').write_bytes(b'ply\nCLEAN')
+        from gsrefine.roi.core import file_sha256
+        clean=out/'gaussian_roi_clean.ply'
+        clean.write_bytes(b'ply\nCLEAN')
+        manifest=roi_run/'metadata'/'manifest.json'
+        source=roi_run/'final'/'gaussian_roi.ply'
         (out / 'stage2_final_report.json').write_text(json.dumps({
             'status': 'COMPLETED_EXPERIMENTAL_CLEAN_ROI_GAUSSIAN',
+            'input': {'stage1_manifest':str(manifest),
+                      'stage1_manifest_sha256':file_sha256(manifest),
+                      'original_roi_gaussian':str(source),
+                      'original_roi_gaussian_sha256':file_sha256(source)},
+            'outputs':{'final_supersplat_gaussian_ply':str(clean),
+                       'final_ply_sha256':file_sha256(clean)},
             'counts': {'final_retained': 7, 'final_removed': 3}}))
         return SimpleNamespace(returncode=0)
     monkeypatch.setattr(cli.subprocess, 'run', run_stage2)
@@ -186,3 +209,5 @@ if __name__=='__main__':main()
     installer.apply(check_only=False)
     assert run.read_bytes() == after_run and server.read_bytes() == after_server
     assert len(list((tmp_path/'.git'/'gsrefine_patch_backups').glob('full_pipeline_*'))) == 1
+
+# gsrefine_engineering_manifest_resume_v1_20261114
