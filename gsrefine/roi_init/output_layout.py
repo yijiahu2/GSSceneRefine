@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 
 from gsrefine.roi_init.results import write_atomic
+from gsrefine.roi import stage1_runtime
 
 LAYOUT_VERSION = 'GSSceneRefine.output.v3'
 FINAL_REL = Path('final/gaussian_roi.ply')
@@ -116,6 +117,7 @@ def publish(out, work, roi, config, report, *, keep_diagnostics=False):
     from gsrefine.roi.core import file_sha256
     if file_sha256(roi) != report['input_sha256']['roi']:
         raise ValueError('Confirmed canonical ROI changed during Stage-1 processing')
+    stage1_runtime.check_inputs()
     dest.parent.mkdir(parents=True, exist_ok=True)
     meta = out / 'metadata'
     meta.mkdir(parents=True, exist_ok=True)
@@ -137,6 +139,11 @@ def publish(out, work, roi, config, report, *, keep_diagnostics=False):
                 target = out/'diagnostics'/ _diagnostic_subdir(file.name)
                 target.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(file), str(target/file.name))
+    stage1_runtime.check_inputs()
+    if stage1_runtime.fast() and _roi_sfm_report is not None:
+        if (stage1_runtime.digest(model) != final['output_sha256']
+                or _roi_sfm_report['stage1_gaussian_roi_sha256_at_publication'] != final['output_sha256']):
+            raise ValueError('Validated Gaussian PLY changed before publication')
     os.replace(model, dest)
     final['output_ply'] = str(dest.resolve())
     final['output_size_bytes'] = dest.stat().st_size

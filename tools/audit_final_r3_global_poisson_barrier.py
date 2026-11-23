@@ -21,7 +21,6 @@ from __future__ import annotations
 import argparse
 import csv
 from datetime import datetime, timezone
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -29,19 +28,17 @@ import tempfile
 
 import numpy as np
 
+if __package__ in (None, ''):
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from gsrefine.cleanup.stage2_runtime import file_digest as sha256_file, measured, mesh_resource
+
 VERSION = 'final_R3_original_global_poisson_region_graph_v3_window_20261112'
 
 
 def log(msg):
     print('[final-r3-barrier] ' + str(msg), flush=True)
-
-
-def sha256_file(path):
-    h = hashlib.sha256()
-    with Path(path).open('rb') as stream:
-        for chunk in iter(lambda: stream.read(4*1024*1024), b''):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def native(obj):
@@ -96,6 +93,10 @@ def eval_r3(fn, pts, batch=2048, name=None):
 
 
 def largest_original_component(original_mesh):
+    return mesh_resource('largest_original_component', original_mesh, _largest_original_component)
+
+
+def _largest_original_component(original_mesh):
     """Extract from ORIGINAL Poisson without altering its triangles or vertices."""
     import trimesh
     n = len(original_mesh.faces)
@@ -115,6 +116,7 @@ def largest_original_component(original_mesh):
                             'Other components excluded, following main-only experiment.'}
 
 
+@measured('audit_roots_on_crossing_edges')
 def roots_on_crossing_edges(xyz, edges, fa, fb, field, *, iterations, eval_batch):
     """Bisection ON ORIGINAL mesh edges, using REAL nonlinear final-R3 function."""
     a = xyz[edges[:,0]]
@@ -136,6 +138,13 @@ def roots_on_crossing_edges(xyz, edges, fa, fb, field, *, iterations, eval_batch
     return roots, residuals, interval
 
 
+def vertex_margins(mesh, field, batch):
+    return mesh_resource(('vertex_margins', field), mesh,
+                         lambda m: eval_r3(field, m.vertices, batch=batch,
+                                           name='Original global-Poisson vertices vs final R3'))
+
+
+@measured('original_wall_intersections')
 def field_edge_crossings(mesh, field, *, iterations=22, batch=2048,
                          near_tolerance=1e-5, output_dir=None, check_same=4000):
     """Numerical continuous-R3/ORIGINAL-Poisson intersection segments.
@@ -146,7 +155,7 @@ def field_edge_crossings(mesh, field, *, iterations=22, batch=2048,
     """
     verts = np.asarray(mesh.vertices, np.float64)
     faces = np.asarray(mesh.faces, np.int64)
-    margins = eval_r3(field, verts, batch=batch, name='Original global-Poisson vertices vs final R3')
+    margins = vertex_margins(mesh, field, batch)
     edge_idx = np.asarray(mesh.edges_unique, dtype=np.int64)
     ea, eb = margins[edge_idx[:,0]], margins[edge_idx[:,1]]
     cross = (ea < -near_tolerance) & (eb > near_tolerance) | (ea > near_tolerance) & (eb < -near_tolerance)
@@ -230,6 +239,10 @@ def field_edge_crossings(mesh, field, *, iterations=22, batch=2048,
 
 
 def make_scene(source_mesh):
+    return mesh_resource('make_scene', source_mesh, _make_scene)
+
+
+def _make_scene(source_mesh):
     import open3d as o3d
     v=np.asarray(source_mesh.vertices, np.float64)
     f=np.asarray(source_mesh.faces, np.int32)
@@ -294,7 +307,7 @@ def _r3_shell_probe(field, lo, hi, *, target_voxel, max_cells, batch=2048):
     boundary[:,:,0]=True;boundary[:,:,-1]=True
     ijk=np.argwhere(boundary)
     xyz=low+(ijk.astype(np.float64)+0.5)*h
-    inside=eval_r3(field,xyz,batch=batch)>0
+    inside=eval_r3(getattr(field,"membership",field),xyz,batch=batch)>0
     hits=ijk[inside]
     sides={}
     for axis,letter in enumerate('xyz'):
@@ -412,10 +425,20 @@ def link_r3_filter(p,q,field,*, batch=2048,samples=3):
     # cannot guarantee no tiny re-entry between samples.
     if samples<1: raise ValueError('samples must be positive')
     allow=np.ones(len(p),bool)
+    if hasattr(field, 'allow_link'):
+        allow = field.allow_link(p,q)
+    pending=allow.copy()
+    if hasattr(field, 'link_radius'):
+        for start in range(0,len(p),8192):
+            sl=slice(start,start+8192)
+            length=np.linalg.norm(q[sl]-p[sl],axis=1)
+            rp=field.link_radius(p[sl])
+            rq=field.link_radius(q[sl])
+            pending[sl]=~((rp>0)&(rq>0)&(rp+rq>length+1e-9))
     for t in np.linspace(0,1,samples+2)[1:-1]:
-        indices=np.flatnonzero(allow)
+        indices=np.flatnonzero(allow & pending)
         if not len(indices): break
-        m=eval_r3(field,(1-t)*p[indices]+t*q[indices],batch=batch)
+        m=eval_r3(getattr(field,"membership",field),(1-t)*p[indices]+t*q[indices],batch=batch)
         allow[indices]=m>0
     return allow
 
@@ -499,11 +522,11 @@ def _path_witness(n,src,dst,start,end,points):
 
 def flood_test(original_main,roi_fn,up,lo,hi,*,name,h_target,max_cells,
                output_dir,batch=2048,link_samples=3, ray_batch=30000,
-               seed_quantile=.90):
+               seed_quantile=.90, observe_links=None):
     h,shape=grid_spec(lo,hi,h_target,max_cells)
     log(f'{name}: grid shape={shape}, node count={np.prod(shape):,}, voxel={h:.6f}')
     xyz=grid_centers(lo,h,shape)
-    margins=eval_r3(roi_fn,xyz,batch=batch,name=f'{name} final R3 membership')
+    margins=eval_r3(getattr(roi_fn,"membership",roi_fn),xyz,batch=batch,name=f'{name} final R3 membership')
     inside=margins>0
     if int(inside.sum())<40:
         raise ValueError('R3 ROI too small at current diagnostic resolution')
@@ -530,8 +553,11 @@ def flood_test(original_main,roi_fn,up,lo,hi,*,name,h_target,max_cells,
     r3_rejected=before-len(src)
     ray_ok=_ray_hit_free(scene,o3d,xyz[src],xyz[dst],eps=min(max(1e-6,h*1e-4),h*.005),batch=ray_batch)
     poisson_blocked=int((~ray_ok).sum())
+    blocked_links=(src[~ray_ok],dst[~ray_ok]) if observe_links is not None else None
     src=src[ray_ok];dst=dst[ray_ok]
     labels,ncomponents=_connected_components(len(xyz),passable,src,dst)
+    if observe_links is not None:
+        observe_links(xyz, labels, src, dst, *blocked_links)
     # True spatial components are the evidence; arbitrary top/bottom probe
     # connectivity is NOT a separation criterion.  Upper-shell reachability
     # remains a diagnostic only, never a pass/fail test.
@@ -572,6 +598,18 @@ def _sample_gaussian_comparison(mask_path,ply,grid_paths,roi_fn,output,batch=204
         raise ValueError('Masks row order/count differs from final ROI Gaussian PLY')
     ix=np.flatnonzero(far)
     if not len(ix):return {'far':0,'sample':0}
+    # Legacy reports carry every exact distance. Optimized reports store NaN
+    # for certified cells; recover exact values needed by this optional audit.
+    missing = ix[~np.isfinite(distance[ix])]
+    if len(missing):
+        import trimesh
+        from gsrefine.cleanup.threshold_distance import exact
+        report = json.loads((Path(mask_path).parent / 'roi_parity_report.json').read_text())
+        mesh = trimesh.load(report['inputs']['main_trusted_poisson'], force='mesh', process=False)
+        scene, o3d = make_scene(mesh)
+        for pos in range(0, len(missing), 30000):
+            rows = missing[pos:pos+30000]
+            distance[rows] = exact(scene, o3d, ply.selected_xyz(rows))
     rng=np.random.default_rng(101110)
     bins=[0,.2,.3,.5,1,2,3,np.inf]
     quota=max(1,int(sample/7))
@@ -609,6 +647,7 @@ def _sample_gaussian_comparison(mask_path,ply,grid_paths,roi_fn,output,batch=204
                    'This is NOT a new Gaussian deletion mask.'}
 
 
+@measured('audit_run')
 def run(args):
     import trimesh
     from gsrefine.cleanup.sdf_common import _load_stage1_manifest
@@ -693,7 +732,7 @@ def run(args):
         if args.only_scale not in (name,'both'):continue
         log(f'Water-flood audit level: {name}')
         try:
-            test=flood_test(original_main,r3_fn,up,lo,hi,
+            test=measured('audit_grid_' + name)(flood_test)(original_main,r3_fn,up,lo,hi,
                             name=name,h_target=desired,max_cells=cap,output_dir=output,
                             batch=args.eval_batch,link_samples=args.roi_link_samples,
                             seed_quantile=args.top_quantile)

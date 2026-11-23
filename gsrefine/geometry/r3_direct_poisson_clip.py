@@ -19,15 +19,9 @@ from pathlib import Path
 
 import numpy as np
 
+from gsrefine.cleanup.stage2_runtime import file_digest as _sha, file_version, measured, reuse, timed
+
 REVISION = 'global_original_main_then_direct_r3_1x_clip_v2_20261112'
-
-
-def _sha(path):
-    hash_ = hashlib.sha256()
-    with Path(path).open('rb') as inp:
-        for block in iter(lambda: inp.read(4 * 1024 * 1024), b''):
-            hash_.update(block)
-    return hash_.hexdigest()
 
 
 def _write_json(path, record):
@@ -69,7 +63,23 @@ def _source_r3_handoff(run_dir, upstream):
         'R3 field from the old initial ROI or from per-SfM distances alone.')
 
 
-def _restore_r3_field(*, inputs, upstream, run_dir, audit_record, audit_samples=768):
+
+
+def _restore_r3_field(*, inputs, upstream, run_dir, audit_record, audit_samples=768, with_interior_radius=False):
+    cfg = Path(run_dir) / 'metadata/effective_scene.yaml'
+    source = upstream.get('source_gaussian')
+    if not source:
+        import yaml
+        source = yaml.safe_load(cfg.read_text())['paths']['gaussian_ply']
+    stamps = [file_version(path) for path in
+              (cfg, audit_record, source, inputs['roi_json'], inputs['clean_sfm_npz'], inputs['poisson_mesh'])]
+    key = ('r3', tuple(stamps), audit_samples)
+    return reuse(key, lambda: _build_r3_field(inputs=inputs, upstream=upstream, run_dir=run_dir,
+                                              audit_record=audit_record, audit_samples=audit_samples))
+
+
+@measured('build_verified_r3_and_tree')
+def _build_r3_field(*, inputs, upstream, run_dir, audit_record, audit_samples):
     """Build an in-memory R3 field with EXACTLY the v3 backfill geometry recipe.
 
     No original input or manifest is modified.  We do not re-run Gaussian R3
@@ -87,78 +97,81 @@ def _restore_r3_field(*, inputs, upstream, run_dir, audit_record, audit_samples=
         longest_gaussian_axis, _project_to_boundary, trimmed_knn_mean)
     from gsrefine.geometry.r3_sfm_bridge import read_verified_handoff
 
-    cfg_path = (run_dir / 'metadata/effective_scene.yaml').resolve(strict=True)
-    cfg = yaml.safe_load(cfg_path.read_text(encoding='utf-8'))
-    if not isinstance(cfg, dict):
-        raise ValueError('Invalid Stage-1 effective_scene.yaml')
-    source = Path(upstream.get('source_gaussian') or cfg['paths']['gaussian_ply']).resolve(strict=True)
-    expected = (upstream.get('input_sha256') or {}).get('gaussian')
-    if expected and _sha(source) != expected:
-        raise ValueError('Stage-1 source Gaussian SHA mismatch; refusing inaccurate R3 replay')
+    with timed('r3_source_read_and_authentication'):
+        cfg_path = (run_dir / 'metadata/effective_scene.yaml').resolve(strict=True)
+        cfg = yaml.safe_load(cfg_path.read_text(encoding='utf-8'))
+        if not isinstance(cfg, dict):
+            raise ValueError('Invalid Stage-1 effective_scene.yaml')
+        source = Path(upstream.get('source_gaussian') or cfg['paths']['gaussian_ply']).resolve(strict=True)
+        expected = (upstream.get('input_sha256') or {}).get('gaussian')
+        if expected and _sha(source) != expected:
+            raise ValueError('Stage-1 source Gaussian SHA mismatch; refusing inaccurate R3 replay')
 
-    stored_d, stored_r, stored_tol, hashes = read_verified_handoff(
-        audit_record, clean_sfm_npz=inputs['clean_sfm_npz'],
-        roi_json=inputs['roi_json'], gaussian_ply=source,
-        poisson_mesh=inputs['poisson_mesh'])
-    roi = ROI.from_file(inputs['roi_json'])
-    global_mesh = trimesh.load(inputs['poisson_mesh'], force='mesh', process=False)
-    if not isinstance(global_mesh, trimesh.Trimesh) or not len(global_mesh.faces):
-        raise ValueError('Stage-1 global Poisson must be a nonempty triangle mesh')
-    full_gaussian = GaussianPLY(source)
-    xyz = full_gaussian.positions()
-    diag = float(np.linalg.norm(np.ptp(xyz, axis=0)))
-    if not np.isfinite(diag) or diag <= 0:
-        raise ValueError('Invalid full Gaussian spatial extent')
-    annotation = json.loads(Path(inputs['roi_json']).read_text(encoding='utf-8'))
-    up = np.asarray(annotation['annotation_metadata']['up_vector'], dtype=np.float64)
-    if up.shape != (3,) or not np.isfinite(up).all() or np.linalg.norm(up) < 1e-9:
-        raise ValueError('Missing Stage-1 verified orientation')
-    up /= np.linalg.norm(up)
+        stored_d, stored_r, stored_tol, hashes = read_verified_handoff(
+            audit_record, clean_sfm_npz=inputs['clean_sfm_npz'],
+            roi_json=inputs['roi_json'], gaussian_ply=source,
+            poisson_mesh=inputs['poisson_mesh'])
+        roi = ROI.from_file(inputs['roi_json'])
+        global_mesh = trimesh.load(inputs['poisson_mesh'], force='mesh', process=False)
+        if not isinstance(global_mesh, trimesh.Trimesh) or not len(global_mesh.faces):
+            raise ValueError('Stage-1 global Poisson must be a nonempty triangle mesh')
+        full_gaussian = GaussianPLY(source)
+        xyz = full_gaussian.positions()
+        diag = float(np.linalg.norm(np.ptp(xyz, axis=0)))
+        if not np.isfinite(diag) or diag <= 0:
+            raise ValueError('Invalid full Gaussian spatial extent')
+        annotation = json.loads(Path(inputs['roi_json']).read_text(encoding='utf-8'))
+        up = np.asarray(annotation['annotation_metadata']['up_vector'], dtype=np.float64)
+        if up.shape != (3,) or not np.isfinite(up).all() or np.linalg.norm(up) < 1e-9:
+            raise ValueError('Missing Stage-1 verified orientation')
+        up /= np.linalg.norm(up)
 
-    # Exact preconditions of r3_sfm_bridge._recompute_original_r3_field().
-    edges = np.asarray(global_mesh.edges_sorted)
-    unique, counts = np.unique(edges, axis=0, return_counts=True)
-    flags = np.zeros(len(global_mesh.vertices), dtype=bool)
-    flags[unique[counts == 1].reshape(-1)] = True
-    global_mesh._roi_boundary_vertex_flags = flags
-    study_cfg = cfg.get('roi_study', {}) or {}
-    if bool(study_cfg.get('poisson_confidence_enabled', False)):
-        sfm_xyz, err, tracks, _fields = load_sfm(inputs['clean_sfm_npz'])
-        confidence, *_ = geometry_confidence(
-            global_mesh, sfm_xyz, err, tracks,
-            k=int(cfg['sfm']['knn_spacing']),
-            weights=tuple(cfg['sfm']['confidence_weights']))
-    else:
-        confidence = np.ones(len(global_mesh.faces), dtype=np.float64)
-    original_analysis = analyze(
-        global_mesh, roi, confidence, float(cfg['sfm']['confidence_threshold']),
-        diag, cfg['guards'], up, candidate_labels={}, study_cfg=study_cfg,
-        growth_multiple=float(study_cfg.get('growth_multiple', 3.0)),
-        scales_count=int(study_cfg.get('growth_steps', 6)))
-    candidates = original_analysis['label_masks']['suspect']
-    local_limit = min(float(cfg['guards']['geodesic_limit_frac']),
-                      float(cfg['guards']['outside_search_frac'])) * diag
-    recovered, _recovery_info = anchored_local_recovery_faces(
-        global_mesh, roi, candidates, original_analysis['inside'], local_limit)
-    initial = roi_polygon_implicit_field(roi)
-    surface, samples = poisson_surface_coverage(global_mesh, recovered, diag)
-    support_radius, _ = estimate_geometric_support_radius(
-        roi, xyz, np.all(roi.distances(xyz) >= -1e-9, axis=1),
-        surface, samples['surface_cover_error_bound'], diag)
-    support = support_radius + samples['surface_cover_error_bound'] if len(surface) else 0.
-    core_field = CoreImplicitField(initial, surface, support)
-    log_scales = np.column_stack([full_gaussian.arr[f'scale_{j}'] for j in range(3)])
-    major_axes = longest_gaussian_axis(log_scales, logarithmic=True)
-    safety_cfg = SafetyConfig(
-        k_neighbors=min(int(cfg['guards'].get('safety_knn', 128)), len(xyz)),
-        trim_fraction=.05, safety_factor=1.0, batch_size=8192,
-        projection_step=max(samples['surface_cover_error_bound'] / 5., diag * 1e-6, 1e-6),
-        projection_tolerance=max(diag * 1e-5, 1e-6))
-    safety_cfg.validate(len(xyz))
-    if not np.isclose(float(safety_cfg.distance_tolerance), stored_tol,
-                      rtol=0., atol=max(1e-9, diag * 1e-8)):
-        raise ValueError('Reconstructed R3 distance tolerance differs from stored v3 record')
-    tree = cKDTree(xyz)
+    with timed('r3_core_field_reconstruction'):
+        # Exact preconditions of r3_sfm_bridge._recompute_original_r3_field().
+        edges = np.asarray(global_mesh.edges_sorted)
+        unique, counts = np.unique(edges, axis=0, return_counts=True)
+        flags = np.zeros(len(global_mesh.vertices), dtype=bool)
+        flags[unique[counts == 1].reshape(-1)] = True
+        global_mesh._roi_boundary_vertex_flags = flags
+        study_cfg = cfg.get('roi_study', {}) or {}
+        if bool(study_cfg.get('poisson_confidence_enabled', False)):
+            sfm_xyz, err, tracks, _fields = load_sfm(inputs['clean_sfm_npz'])
+            confidence, *_ = geometry_confidence(
+                global_mesh, sfm_xyz, err, tracks,
+                k=int(cfg['sfm']['knn_spacing']),
+                weights=tuple(cfg['sfm']['confidence_weights']))
+        else:
+            confidence = np.ones(len(global_mesh.faces), dtype=np.float64)
+        original_analysis = analyze(
+            global_mesh, roi, confidence, float(cfg['sfm']['confidence_threshold']),
+            diag, cfg['guards'], up, candidate_labels={}, study_cfg=study_cfg,
+            growth_multiple=float(study_cfg.get('growth_multiple', 3.0)),
+            scales_count=int(study_cfg.get('growth_steps', 6)))
+        candidates = original_analysis['label_masks']['suspect']
+        local_limit = min(float(cfg['guards']['geodesic_limit_frac']),
+                          float(cfg['guards']['outside_search_frac'])) * diag
+        recovered, _recovery_info = anchored_local_recovery_faces(
+            global_mesh, roi, candidates, original_analysis['inside'], local_limit)
+        initial = roi_polygon_implicit_field(roi)
+        surface, samples = poisson_surface_coverage(global_mesh, recovered, diag)
+        support_radius, _ = estimate_geometric_support_radius(
+            roi, xyz, np.all(roi.distances(xyz) >= -1e-9, axis=1),
+            surface, samples['surface_cover_error_bound'], diag)
+        support = support_radius + samples['surface_cover_error_bound'] if len(surface) else 0.
+        core_field = CoreImplicitField(initial, surface, support)
+        log_scales = np.column_stack([full_gaussian.arr[f'scale_{j}'] for j in range(3)])
+        major_axes = longest_gaussian_axis(log_scales, logarithmic=True)
+        safety_cfg = SafetyConfig(
+            k_neighbors=min(int(cfg['guards'].get('safety_knn', 128)), len(xyz)),
+            trim_fraction=.05, safety_factor=1.0, batch_size=8192,
+            projection_step=max(samples['surface_cover_error_bound'] / 5., diag * 1e-6, 1e-6),
+            projection_tolerance=max(diag * 1e-5, 1e-6))
+        safety_cfg.validate(len(xyz))
+        if not np.isclose(float(safety_cfg.distance_tolerance), stored_tol,
+                          rtol=0., atol=max(1e-9, diag * 1e-8)):
+            raise ValueError('Reconstructed R3 distance tolerance differs from stored v3 record')
+    with timed('r3_full_gaussian_tree'):
+        tree = cKDTree(xyz)
 
     def margin(queries, chunk_size=8192, return_detail=False):
         """Nonnegative = inside original R3 (post-restoration) 1x spatial mask.
@@ -191,24 +204,25 @@ def _restore_r3_field(*, inputs, upstream, run_dir, audit_record, audit_samples=
             return signed, rs, ds, projection_failures
         return signed
 
-    if audit_samples < 32:
-        raise ValueError('audit_samples must be at least 32')
-    with np.load(inputs['clean_sfm_npz'], allow_pickle=False) as data:
-        sfm_xyz = data['xyz']
-        n = len(sfm_xyz)
-        # A deterministic mixture of broad and boundary-adjacent positions.
-        amount = min(int(audit_samples), n)
-        random_rows = np.linspace(0, n - 1, amount // 2 + amount % 2, dtype=np.int64)
-        closest = np.argpartition(np.abs(stored_d - stored_r), min(n - 1, amount // 2))[:amount // 2]
-        ids = np.unique(np.r_[random_rows, closest])
-        _m, computed_r, computed_d, failures = margin(sfm_xyz[ids], return_detail=True)
-    dd = np.abs(computed_d - stored_d[ids])
-    dr = np.abs(computed_r - stored_r[ids])
-    if (float(dd.max(initial=0)) > max(2e-6, diag * 2e-7)
-            or float(dr.max(initial=0)) > max(2e-6, diag * 2e-7)):
-        raise ValueError('R3 field replay does NOT match verified SfM v3 handoff: '
-                         f'max |d| error={dd.max():.6g}; max radius error={dr.max():.6g}. '
-                         'Refusing unverified geometric clipping.')
+    with timed('r3_handoff_consistency_check'):
+        if audit_samples < 32:
+            raise ValueError('audit_samples must be at least 32')
+        with np.load(inputs['clean_sfm_npz'], allow_pickle=False) as data:
+            sfm_xyz = data['xyz']
+            n = len(sfm_xyz)
+            # A deterministic mixture of broad and boundary-adjacent positions.
+            amount = min(int(audit_samples), n)
+            random_rows = np.linspace(0, n - 1, amount // 2 + amount % 2, dtype=np.int64)
+            closest = np.argpartition(np.abs(stored_d - stored_r), min(n - 1, amount // 2))[:amount // 2]
+            ids = np.unique(np.r_[random_rows, closest])
+            _m, computed_r, computed_d, failures = margin(sfm_xyz[ids], return_detail=True)
+        dd = np.abs(computed_d - stored_d[ids])
+        dr = np.abs(computed_r - stored_r[ids])
+        if (float(dd.max(initial=0)) > max(2e-6, diag * 2e-7)
+                or float(dr.max(initial=0)) > max(2e-6, diag * 2e-7)):
+            raise ValueError('R3 field replay does NOT match verified SfM v3 handoff: '
+                             f'max |d| error={dd.max():.6g}; max radius error={dr.max():.6g}. '
+                             'Refusing unverified geometric clipping.')
 
     record = {
         'source_gaussian': str(source),
@@ -226,6 +240,35 @@ def _restore_r3_field(*, inputs, upstream, run_dir, audit_record, audit_samples=
         'reference_mesh_same_as_stage1': True,
         'source_hashes': hashes,
     }
+    from gsrefine.cleanup.adaptive_voxel import make_interior_radius
+    scale = max(np.abs(global_mesh.bounds).max(), diag)
+    margin.interior_radius = make_interior_radius(core_field, roi, safety_cfg.distance_tolerance, scale)
+
+    # The trimmed mean of any k source radii lies between the global
+    # minimum and maximum. Use these bounds only in the local-region mode.
+    lower_tolerance = safety_cfg.distance_tolerance + float(major_axes.min()) * safety_cfg.safety_factor
+    margin.region_radius = make_interior_radius(core_field, roi, lower_tolerance, scale)
+    upper_tolerance = safety_cfg.distance_tolerance + float(major_axes.max()) * safety_cfg.safety_factor
+    upper_tolerance += max(1e-9, 256*np.finfo(float).eps*scale)
+
+    def region_membership(points):
+        core_values = core_field.evaluate(points)
+        values = np.where(core_values > upper_tolerance, -1., 1.)
+        unknown = (core_values >= lower_tolerance-1e-8*max(1.,scale)) & (core_values <= upper_tolerance)
+        if unknown.any():
+            values[unknown] = margin(points[unknown])
+        return values
+
+    margin.region_membership = region_membership
+
+    def membership(points):
+        values = np.ones(len(points))
+        exact_rows = margin.interior_radius(points) <= 0
+        if exact_rows.any():
+            values[exact_rows] = margin(points[exact_rows])
+        return values
+
+    margin.membership = membership
     return global_mesh, margin, record
 
 
@@ -275,6 +318,7 @@ def _fit(mesh, reference_points):
             'p99': float(np.quantile(distances, .99))}
 
 
+@measured('direct_r3_clip')
 def run(*, manifest, fit_max_points=60000,
         audit_samples=768, query_batch=8192):
     """Produce ONLY a directly clipped Stage-1 Poisson and reproducible diagnostics."""
@@ -342,12 +386,8 @@ def run(*, manifest, fit_max_points=60000,
     full_global_topology = _topology(global_mesh)
     global_mesh, original_main_info = largest_original_component(global_mesh)
     source_verts = np.asarray(global_mesh.vertices, np.float64)
-    signed = np.empty(len(source_verts), dtype=np.float64)
-    for a in range(0, len(source_verts), query_batch):
-        b = min(len(source_verts), a + query_batch)
-        signed[a:b] = margin_fn(source_verts[a:b], chunk_size=query_batch)
-        if a == 0 or b == len(source_verts) or a // query_batch % 20 == 0:
-            print(f'[direct-r3-clip] global Poisson vertex R3 queries {b:,}/{len(source_verts):,}', flush=True)
+    from tools.audit_final_r3_global_poisson_barrier import vertex_margins
+    signed = vertex_margins(global_mesh, margin_fn, query_batch)
     # Finite alias audit: a nonlinear R3 union can intersect a triangle even
     # when all three corner signs agree.  Report, do NOT silently fix interiors
     # by deleting faces based on SfM density.

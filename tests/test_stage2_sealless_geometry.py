@@ -175,7 +175,11 @@ def test_duplicate_same_geometry_reports_do_not_block_onepass(tmp_path,monkeypat
     run=tmp_path/'roi_001'; root=run/'cleanup/geometry/direct_r3_sdf'
     for n in ('a','b'):
         p=root/n/'preseal_diagnostics.json';p.parent.mkdir(parents=True)
-        p.write_text(json.dumps({'main_observed_surface_sha256':'same',
+        clip = p.parent/'clip_report.json'
+        clip.write_text(json.dumps({'source_component_selection':
+            'largest_original_edge_connected_component_BEFORE_R3_clip'}))
+        p.write_text(json.dumps({'direct_r3_clip_report':str(clip),
+                                 'main_observed_surface_sha256':'same',
                                  'auxiliary_observed_surface_sha256':None,
                                  'sfm_fit':{'p95':.1,'source_core_sfm_count':101},
                                  'stage1_manifest':str(run/'metadata/manifest.json')}))
@@ -189,3 +193,22 @@ def test_duplicate_same_geometry_reports_do_not_block_onepass(tmp_path,monkeypat
     (root/'b/preseal_diagnostics.json').write_text(json.dumps(d))
     with pytest.raises(ValueError,match='DIFFERENT authenticated'):
         runner._discover_preseal(run/'metadata/manifest.json', run)
+
+
+def test_run_reuses_geometry_and_rejects_changed_main(prepared):
+    from gsrefine.cleanup.stage2_runtime import run_scope, snapshot
+
+    manifest, report, _, _, main = prepared
+
+    @run_scope
+    def verify():
+        first = validate_parity_geometry(manifest, report)
+        second = validate_parity_geometry(manifest, report)
+        assert second is first
+        assert snapshot()['steps']['validate_local_geometry']['calls'] == 1
+        raw = main.read_bytes()
+        main.write_bytes(raw[:-1] + bytes([raw[-1] ^ 1]))
+        with pytest.raises(ValueError, match='SHA256 mismatch'):
+            validate_parity_geometry(manifest, report)
+
+    verify()

@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from gsrefine.roi import stage1_runtime
 
 from gsrefine.roi_init.settings import PROJECT_ROOT, InitSettings
 from gsrefine.roi_init.results import current_latest_for_source, require_orientation, write_atomic
@@ -153,14 +154,18 @@ def _pid_alive(pid):
         return False
 
 
+@stage1_runtime.managed
 def run_once(config, roi, output_dir=None, *, reuse_scene_roi=False,
-             keep_diagnostics=False):
+             keep_diagnostics=False, accelerate_stage1=True, optimization_version=2):
     """Four-module sync workflow; --output-dir always means the output ROOT.
 
     Module-3's validated algorithm writes into a temporary, isolated study
     directory. Only final outputs and requested diagnostics are published.
     """
     from gsrefine.geometry.prepare import prepare_scene
+    started = time.perf_counter()
+    phase_start, phase_name = started, 'prepared_config_and_validation'
+    phase_times = {}
     config = prepare_scene(config)
     roi = Path(roi).expanduser().resolve(strict=True)
     out = output_for_roi(config, roi, output_root=output_dir)
@@ -175,13 +180,24 @@ def run_once(config, roi, output_dir=None, *, reuse_scene_roi=False,
     require_orientation(json.loads(roi.read_text(encoding='utf8')), settings,
                         reuse_scene_geometry=reuse_scene_roi)
     scene_config = yaml.safe_load(config.read_text(encoding='utf8'))
+    paths = scene_config['paths']
+    stage1_runtime.watch_inputs((roi, paths['gaussian_ply'], paths['clean_sfm_npz'], paths['poisson_raw']))
     study_source = Path(scene_config['paths']['gaussian_ply']).expanduser().resolve()
     if study_source != settings.gaussian_ply:
         raise ValueError('Module 2 display Gaussian and Module 3 study Gaussian differ')
     update_progress(out, 'loading', detail='读取原始Gaussian和可信Poisson曲面')
 
+    def change_phase(name):
+        nonlocal phase_start, phase_name
+        now = time.perf_counter()
+        phase_times[phase_name] = phase_times.get(phase_name, 0.0) + now - phase_start
+        phase_start, phase_name = now, name
+
     def report_stage(phase, detail=''):
+        change_phase(phase)
         update_progress(out, phase, detail=detail)
+
+    change_phase('loading')
 
     from gsrefine.roi.study import run as run_study
     # TemporaryDirectory cleans even on Python exceptions. For SIGKILL,
@@ -194,7 +210,9 @@ def run_once(config, roi, output_dir=None, *, reuse_scene_roi=False,
         work = Path(scratch)
         report = run_study(config, roi, work, run_ablation=True, final_only=True,
                            export_final=True, final_method='R3', progress_callback=report_stage,
-                           save_diagnostics=keep_diagnostics, save_indices=keep_diagnostics)
+                           save_diagnostics=keep_diagnostics, save_indices=keep_diagnostics,
+                           **({} if accelerate_stage1 else {'accelerate_stage1': False}))
+        change_phase('verification_and_publication')
         update_progress(out, 'verifying', detail='检查PLY、ROI身份和恢复数量')
         final = report.get('final_gaussian_scene') or {}
         ply = Path(final.get('output_ply', ''))
@@ -226,6 +244,20 @@ def run_once(config, roi, output_dir=None, *, reuse_scene_roi=False,
         'processing_report': str(out/'metadata/processing_report.json'),
         'manifest': str(out/MANIFEST_REL),
     }
+    change_phase('finished')
+    safety_info = stages.get('stage_B', {})
+    timing = {
+        'handoff_and_publication': stage1_runtime.report(),
+        'elapsed_to_publication_s': phase_start - started,
+        'phases_s': phase_times,
+        'recovery_substeps_s': stages.get('timing_s', {}),
+        'safety': {key: safety_info.get(key) for key in (
+            'num_candidates', 'early_keep', 'early_drop', 'exact_queries',
+            'exact_projection_failed', 'projection_s', 'knn_s', 'radius_statistics_scope')},
+        'mask_sha256': report.get('stage1_mask_sha256', {}),
+        'accelerated': accelerate_stage1,
+    }
+    write_atomic(out / 'metadata/stage1_timing.json', timing)
     write_atomic(result_path(out), result)
     update_progress(out, 'completed', detail='Gaussian ROI已导出且通过一致性检查')
     print(f'[roi-auto] Complete: {result["final_ply"]}', flush=True)

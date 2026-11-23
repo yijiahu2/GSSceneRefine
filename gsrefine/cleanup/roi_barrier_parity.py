@@ -16,11 +16,14 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 import json
-import hashlib
 import os
 import tempfile
+from gsrefine.cleanup.threshold_distance import classify_distance, exact_requested
+from time import perf_counter
 
 import numpy as np
+
+from gsrefine.cleanup.stage2_runtime import file_digest as _sha, measured, mesh_resource, timed
 
 VERSION = 'GSSceneRefine.roi_barrier_parity_sdf.v3'
 OUTSIDE, INSIDE, UNKNOWN = 0, 1, -1
@@ -28,14 +31,6 @@ OUTSIDE, INSIDE, UNKNOWN = 0, 1, -1
 
 def _log(message):
     print('[stage2-roi-parity] ' + str(message), flush=True)
-
-
-def _sha(path):
-    h = hashlib.sha256()
-    with open(path, 'rb') as f:
-        for chunk in iter(lambda: f.read(4 * 1024 * 1024), b''):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def _json_native(value):
@@ -97,6 +92,7 @@ def _validate_intersection_loop(archive):
             'segment_endpoint_max_error': float(d.max())}
 
 
+@measured('audit_identity')
 def _audit_identity(audit_dir, manifest_path, inputs, r3_record, *,
                     field, wall_scene, o3d, normals, output):
     root = Path(audit_dir).expanduser().resolve(strict=True)
@@ -215,41 +211,30 @@ def _crossings_from_hits(result, lengths, dirs, tri_normals=None, *,
     face = np.asarray(result['primitive_ids'], np.int64).ravel()
     if len(splits) != n + 1 or len(t) != len(face) or len(t) != len(uv) or splits[-1] != len(t):
         raise RuntimeError('Malformed Open3D list_intersections return shape')
-    for i in range(n):
-        if not valid[i]:
-            continue
-        start, stop = int(splits[i]), int(splits[i + 1])
-        if stop == start:
-            continue
-        distances = t[start:stop]
-        uvs = uv[start:stop]
-        fid = face[start:stop]
-        if not np.isfinite(distances).all() or not np.isfinite(uvs).all():
-            valid[i] = False; continue
-        if np.any((distances >= -endpoint_tol) & (distances <= endpoint_tol)) or \
-           np.any((distances >= lengths[i] - endpoint_tol) &
-                  (distances <= lengths[i] + endpoint_tol)):
-            valid[i] = False; continue
-        within = (distances > endpoint_tol) & (distances < lengths[i] - endpoint_tol)
-        if not np.any(within):
-            continue
-        tt, uu, ff = distances[within], uvs[within], fid[within]
-        bary = np.c_[uu, 1. - uu.sum(axis=1)]
-        if np.any(bary < uv_tol) or np.any(bary > 1 + uv_tol):
-            valid[i] = False; continue
-        if tri_normals is not None:
-            normals = np.asarray(tri_normals)[ff]
-            if np.any(np.abs(normals @ dirs[i]) < tangent_tol):
-                valid[i] = False; continue
-        tt = np.sort(tt)
-        if len(tt) > 1 and np.any(np.diff(tt) <= max(endpoint_tol, lengths[i] * 1e-5)):
-            valid[i] = False; continue
-        parities[i] = len(tt) % 2
+    ray = np.repeat(np.arange(n), np.diff(splits))
+    invalid = ~np.isfinite(t) | ~np.isfinite(uv).all(axis=1)
+    invalid |= (t >= -endpoint_tol) & (t <= endpoint_tol)
+    invalid |= (t >= lengths[ray] - endpoint_tol) & (t <= lengths[ray] + endpoint_tol)
+    valid[ray[invalid]] = False
+    within = (t > endpoint_tol) & (t < lengths[ray] - endpoint_tol)
+    ray, t, uv = ray[within], t[within], uv[within]
+    bary = np.column_stack((uv, 1. - uv.sum(axis=1)))
+    bad = ((bary < uv_tol) | (bary > 1 + uv_tol)).any(axis=1)
+    if tri_normals is not None:
+        dot = np.einsum('ij,ij->i', np.asarray(tri_normals)[face[within]], dirs[ray])
+        bad |= np.abs(dot) < tangent_tol
+    valid[ray[bad]] = False
+    order = np.lexsort((t, ray))
+    sorted_ray = ray[order]
+    same = sorted_ray[1:] == sorted_ray[:-1]
+    close = np.diff(t[order]) <= np.maximum(endpoint_tol, lengths[sorted_ray[1:]] * 1e-5)
+    valid[sorted_ray[1:][same & close]] = False
+    parities[valid] = np.bincount(ray, minlength=n)[valid] % 2
     return parities, valid
 
 
 def segment_parity(scene, o3d, origins, targets, *, normals=None,
-                   ray_batch=8000, endpoint_tol=1e-5):
+                   ray_batch=8000, endpoint_tol=1e-5, timing_prefix='navigation'):
     """Original triangles, ALL segment intersections, with degeneracy rejection."""
     origins = np.asarray(origins, np.float64).reshape(-1, 3)
     targets = np.asarray(targets, np.float64).reshape(-1, 3)
@@ -263,14 +248,17 @@ def segment_parity(scene, o3d, origins, targets, *, normals=None,
         length = np.linalg.norm(dr, axis=1)
         direction = dr / np.maximum(length[:, None], 1e-20)
         rays = np.ascontiguousarray(np.c_[origins[a:b], direction], np.float32)
-        raw = scene.list_intersections(o3d.core.Tensor(rays))
-        parsed = {k: raw[k].numpy() for k in ('ray_splits', 't_hit', 'primitive_uvs', 'primitive_ids')}
-        bits[a:b], reliable[a:b] = _crossings_from_hits(parsed, length, direction,
-                                                         normals, endpoint_tol=endpoint_tol)
+        with timed(timing_prefix + '_triangle_intersections'):
+            raw = scene.list_intersections(o3d.core.Tensor(rays))
+            parsed = {k: raw[k].numpy() for k in ('ray_splits', 't_hit', 'primitive_uvs', 'primitive_ids')}
+        with timed(timing_prefix + '_intersection_parsing'):
+            bits[a:b], reliable[a:b] = _crossings_from_hits(parsed, length, direction,
+                                                             normals, endpoint_tol=endpoint_tol)
     return bits, reliable
 
 
-def _prepare_geometry(manifest, preseal_report, *, config_file=None):
+@measured('prepare_geometry')
+def _prepare_geometry(manifest, preseal_report, *, config_file=None, with_interior_radius=False, local_sheet_only=False, defer_global_component=False):
     # Formal Stage 2 is SEALLESS. Legacy single-ring cap/skirt eligibility is
     # not a geometric prerequisite for original-Poisson parity classification.
     from gsrefine.cleanup.stage2_geometry_validation import validate_parity_geometry
@@ -285,16 +273,18 @@ def _prepare_geometry(manifest, preseal_report, *, config_file=None):
     handoff = _source_r3_handoff(Path(original_run_dir), upstream)
     orig_global, field, replay = _restore_r3_field(
         inputs=original_inputs, upstream=upstream, run_dir=Path(original_run_dir),
-        audit_record=handoff, audit_samples=768)
-    global_main, source_stats = largest_original_component(orig_global)
-    wall_scene, o3d = make_scene(global_main)
-    from gsrefine.cleanup.sdf_common import _raycast
-    distance_scene = _raycast(o3d, main)
-    faces = np.asarray(global_main.faces, np.int64)
-    vertices = np.asarray(global_main.vertices, np.float64)
-    normals = np.cross(vertices[faces[:, 1]] - vertices[faces[:, 0]],
-                       vertices[faces[:, 2]] - vertices[faces[:, 0]])
-    normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-20)
+        audit_record=handoff, audit_samples=768, with_interior_radius=with_interior_radius)
+    if not (local_sheet_only and defer_global_component):
+        global_main, source_stats = largest_original_component(orig_global)
+    if not local_sheet_only:
+        wall_scene, o3d = make_scene(global_main)
+        from gsrefine.cleanup.sdf_common import _raycast
+        distance_scene = _raycast(o3d, main)
+        faces = np.asarray(global_main.faces, np.int64)
+        vertices = np.asarray(global_main.vertices, np.float64)
+        normals = np.cross(vertices[faces[:, 1]] - vertices[faces[:, 0]],
+                           vertices[faces[:, 2]] - vertices[faces[:, 0]])
+        normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-20)
     roi_raw = json.loads(Path(inputs['roi_json']).read_text('utf-8'))
     meta = roi_raw.get('annotation_metadata', {})
     if meta.get('orientation_verified') is not True:
@@ -326,6 +316,7 @@ def _navigation_identity(audit_report, grid_path, *, roi_link_samples=3):
     }
 
 
+@measured('make_navigation')
 def _make_navigation(grid_path, field, up, wall_scene, o3d, normals, *,
                      exterior_seed=None, neighbour_rays_batch=8000, roi_link_samples=3):
     from tools.audit_final_r3_global_poisson_barrier import (
@@ -401,6 +392,20 @@ def _make_navigation(grid_path, field, up, wall_scene, o3d, normals, *,
             'summary': summary}
 
 
+@measured('ray_navigation_tree_build')
+def _ray_navigation_tree(index):
+    from scipy.spatial import cKDTree
+    from tools.audit_final_r3_global_poisson_barrier import grid_centers
+
+    labels = np.asarray(index['labels'], np.int8).ravel()
+    available = np.flatnonzero(labels != UNKNOWN)
+    centers = grid_centers(index['origin'], float(index['voxel']), tuple(int(n) for n in index['shape']))
+    if len(labels) != len(centers):
+        raise ValueError('Navigation grid label size mismatch')
+    return labels, available, centers, cKDTree(centers[available])
+
+
+@measured('query_nearby_candidates')
 def _query_nearby_candidates(points, index, field, scene, o3d, normals, *,
                              neighbours=8, min_agree=2, batch=3000, roi_link_samples=3):
     """Adaptive exact parity queries for Gaussian centres beyond the SDF threshold.
@@ -416,23 +421,17 @@ def _query_nearby_candidates(points, index, field, scene, o3d, normals, *,
     numerical/topological query; the formal-clean export is blocked if any
     over-threshold centre has this state.
     """
-    from scipy.spatial import cKDTree
-    from tools.audit_final_r3_global_poisson_barrier import grid_centers, eval_r3, link_r3_filter
+    from tools.audit_final_r3_global_poisson_barrier import eval_r3, link_r3_filter
 
     pts = np.asarray(points, np.float64).reshape(-1, 3)
     if not np.isfinite(pts).all():
         raise ValueError('Gaussian centres contain non-finite coordinates')
     if int(batch) < 1 or int(neighbours) < 1 or int(min_agree) < 1:
         raise ValueError('Invalid adaptive short-ray query settings')
-    labels = np.asarray(index['labels'], np.int8).ravel()
-    available = np.flatnonzero(labels != UNKNOWN)
+    labels, available, centers, tree = mesh_resource('ray_navigation_tree', index, _ray_navigation_tree)
     if len(available) < int(min_agree):
         raise RuntimeError('Too few verified navigation nodes to establish side labels')
     voxel = float(index['voxel'])
-    centers = grid_centers(index['origin'], voxel, tuple(int(x) for x in index['shape']))
-    if len(labels) != len(centers):
-        raise ValueError('Navigation grid label size mismatch')
-    tree = cKDTree(centers[available])
     start_k = max(int(min_agree), int(neighbours))
     raw_stages = [(start_k, 2.5), (max(start_k * 3, 24), 6.0),
                   (max(start_k * 8, 96), 16.0)]
@@ -457,7 +456,8 @@ def _query_nearby_candidates(points, index, field, scene, o3d, normals, *,
     for begin in range(0, len(pts), int(batch)):
         end = min(begin + int(batch), len(pts))
         cloud = pts[begin:end]
-        inside_roi = eval_r3(field, cloud, batch=2048) > 0
+        with timed('ray_origin_r3_check'):
+            inside_roi = eval_r3(field, cloud, batch=2048) > 0
         details['rejected_outside_final_r3'] += int(np.count_nonzero(~inside_roi))
         current = np.full(len(cloud), UNKNOWN, np.int8)
         conflicted = np.zeros(len(cloud), bool)
@@ -467,36 +467,38 @@ def _query_nearby_candidates(points, index, field, scene, o3d, normals, *,
                 break
             details['stage_attempted'][stage_id] += int(len(pending))
             p = cloud[pending]
-            distances, nearest = tree.query(p, k=k)
+            with timed('ray_nearest_nodes'):
+                distances, nearest = tree.query(p, k=k)
             distances = np.asarray(distances, float).reshape(len(pending), k)
             nearest = np.asarray(nearest, np.int64).reshape(len(pending), k)
             node_ids = available[nearest]
             proposed = np.full((len(pending), k), UNKNOWN, np.int8)
             within_radius = distances <= (radius * voxel)
-            for j in range(k):
-                subset = np.flatnonzero(within_radius[:, j])
-                if not len(subset):
-                    continue
-                from_xyz = centers[node_ids[subset, j]]
-                to_xyz = p[subset]
-                # Long rays in concave R3 need more samples; three samples are
-                # insufficient when distant nodes are used for fallback.
-                ray_length = np.linalg.norm(to_xyz - from_xyz, axis=1)
-                max_length = float(ray_length.max()) if len(ray_length) else 0.0
-                samples = max(int(roi_link_samples), int(np.ceil(max_length / max(voxel * .5, 1e-10))))
-                samples = min(samples, 41)
-                roi_ok = link_r3_filter(from_xyz, to_xyz, field,
-                                        samples=samples, batch=2048)
-                subset = subset[roi_ok]
-                if not len(subset):
-                    continue
-                from_xyz = centers[node_ids[subset, j]]
-                to_xyz = p[subset]
-                parity, ray_ok = segment_parity(
-                    scene, o3d, from_xyz, to_xyz, normals=normals,
-                    endpoint_tol=max(1e-6, voxel * 1e-5), ray_batch=max(256, int(batch)))
-                passed = subset[ray_ok]
-                proposed[passed, j] = labels[node_ids[passed, j]] ^ parity[ray_ok]
+            rows, cols = np.nonzero(within_radius)
+            if len(rows):
+                # Preserve the original per-column sampling density even when rays
+                # from several neighbours share a single intersection submission.
+                lengths = np.linalg.norm(p[rows] - centers[node_ids[rows, cols]], axis=1)
+                longest = np.zeros(k)
+                np.maximum.at(longest, cols, lengths)
+                samples = np.clip(np.ceil(longest / max(voxel * .5, 1e-10)),
+                                  roi_link_samples, 41).astype(int)
+                for count in np.unique(samples[cols]):
+                    selected = np.flatnonzero(samples[cols] == count)
+                    for offset in range(0, len(selected), max(8192, batch)):
+                        take = selected[offset:offset + max(8192, batch)]
+                        rr, cc = rows[take], cols[take]
+                        nodes = node_ids[rr, cc]
+                        with timed('ray_segment_r3_check'):
+                            ok = link_r3_filter(centers[nodes], p[rr], field,
+                                                samples=int(count), batch=2048)
+                        rr, cc, nodes = rr[ok], cc[ok], nodes[ok]
+                        if len(rr):
+                            bits, reliable = segment_parity(
+                                scene, o3d, centers[nodes], p[rr], normals=normals,
+                                endpoint_tol=max(1e-6, voxel * 1e-5), ray_batch=max(256, batch),
+                                timing_prefix='ray')
+                            proposed[rr[reliable], cc[reliable]] = labels[nodes[reliable]] ^ bits[reliable]
             positive = (proposed == INSIDE).sum(axis=1)
             negative = (proposed == OUTSIDE).sum(axis=1)
             total = positive + negative
@@ -549,12 +551,13 @@ def _check_output(output_dir, run_dir):
     return output
 
 
+@measured('run_roi_barrier_parity')
 def run_roi_barrier_parity(*, manifest, preseal_report, output_dir,
                            barrier_audit_dir=None, index_cache=None,
                            classification_only=True, confirm_exterior=False,
                            chunk_size=30000, nearest_k=8, min_agree=2,
                            exterior_seed=None, config_file=None,
-                           roi_link_samples=3, ray_batch=8000):
+                           roi_link_samples=3, ray_batch=8000, classifier="short-ray"):
     """Complete reusable Stage-2 experiment, with source auditing and fail-closed unknowns."""
     from gsrefine.cleanup.sdf_common import robust_gaussian_radius
     from gsrefine.roi.core import GaussianPLY
@@ -569,7 +572,11 @@ def run_roi_barrier_parity(*, manifest, preseal_report, output_dir,
         raise ValueError('Invalid parity query, ray batch, or ROI path sampling settings')
     if not classification_only and not confirm_exterior:
         raise ValueError('Clean PLY export requires --confirm-exterior after reviewing classification results')
-    inputs_data = _prepare_geometry(manifest, preseal_report, config_file=config_file)
+    from gsrefine.cleanup.adaptive_voxel import CLASSIFIERS, MAX_DEPTH, REVISION, WallClearance, classify
+    if classifier not in CLASSIFIERS:
+        raise ValueError(f"Unknown candidate classifier: {classifier}")
+    inputs_data = _prepare_geometry(manifest, preseal_report, config_file=config_file,
+                                    with_interior_radius=classifier != 'short-ray')
     record = inputs_data['record']; inputs = inputs_data['inputs']
     run_dir = inputs_data['run_dir']; preseal = inputs_data['preseal']
     field = inputs_data['field']; up = inputs_data['up']
@@ -646,25 +653,48 @@ def run_roi_barrier_parity(*, manifest, preseal_report, output_dir,
     epsilon = float(DEFAULTS['epsilon'])
     if not np.isfinite(delta) or delta <= 0:
         raise ValueError('Invalid adaptive SDF distance threshold')
-    distances = np.empty(len(centers), np.float32)
-    for a in range(0, len(centers), chunk_size):
-        b = min(a + chunk_size, len(centers))
-        q = o3d.core.Tensor(np.ascontiguousarray(centers[a:b], dtype=np.float32))
-        result = np.asarray(distance_scene.compute_distance(q).numpy(), np.float32).ravel()
-        if not np.isfinite(result).all() or len(result) != b - a:
-            raise ValueError('Nonfinite distance-to-local-triangle result')
-        distances[a:b] = result
-        if a == 0 or b == len(centers) or (a // chunk_size) % 10 == 0:
-            _log(f'ALL Gaussian exact unsigned distance {b:,}/{len(centers):,}')
-    candidate = distances.astype(np.float64) > delta + epsilon
+    distances, candidate, distance_stats = classify_distance(
+        distance_scene, o3d, centers, delta + epsilon, inputs_data['main'].bounds,
+        chunk_size, classifier == 'adaptive-voxel' and not exact_requested(), _log)
     candidate_ids = np.flatnonzero(candidate)
     _log(f'Adaptive delta={delta:.12f}; over threshold {len(candidate_ids):,}/{len(centers):,}')
     occupancy = np.full(len(centers), UNKNOWN, np.int8)
-    classified, diagnostics = _query_nearby_candidates(
-        centers[candidate_ids], index, field, wall_scene, o3d, normals,
-        neighbours=nearest_k, min_agree=min_agree,
-        batch=max(500, chunk_size // max(1, nearest_k)),
-        roi_link_samples=roi_link_samples)
+    batch_size = max(500, chunk_size // max(1, nearest_k))
+    def membership(points):
+        # This callable is used ONLY for the strict positive membership tests
+        # on candidate rays. Intersection roots and numerical margins still use field().
+        safe = field.interior_radius(points) > 0.
+        values = np.ones(len(points), dtype=np.float64)
+        if not safe.all():
+            values[~safe] = field(points[~safe])
+        return values
+
+    ray_field = field if classifier == 'short-ray' else membership
+    def query_rays(points):
+        return _query_nearby_candidates(points, index, ray_field, wall_scene, o3d, normals,
+                                        neighbours=nearest_k, min_agree=min_agree,
+                                        batch=batch_size, roi_link_samples=roi_link_samples)
+
+    started = perf_counter()
+    if not len(candidate_ids):
+        classified = np.empty(0, np.int8)
+        diagnostics = dict(candidate_count=0, direct_points=0, fallback_points=0,
+                           representative_queries=0, conflicting_paths=0, index_seconds=0.)
+    elif classifier == 'short-ray':
+        classified, diagnostics = query_rays(centers[candidate_ids])
+        diagnostics.update(direct_points=0, fallback_points=len(candidate_ids),
+                           representative_queries=0, index_seconds=0.)
+    else:
+        _log(f"Building occupied-cell classifier on {len(original_main.faces):,} original wall faces")
+        clearance = WallClearance(original_main.vertices, original_main.faces)
+        index_seconds = perf_counter() - started
+        classified, diagnostics = measured('adaptive_voxel_and_fallback')(classify)(
+            centers[candidate_ids], index, field.interior_radius, clearance, query_rays,
+            max_depth=0 if classifier == 'base-voxel' else MAX_DEPTH, log=_log)
+        diagnostics['index_seconds'] = index_seconds
+    diagnostics['total_seconds'] = perf_counter() - started
+    _log(f"Classifier={classifier} direct={diagnostics['direct_points']:,} "
+         f"fallback={diagnostics['fallback_points']:,} time={diagnostics['total_seconds']:.1f}s")
     occupancy[candidate_ids] = classified
     remove = candidate & (occupancy == OUTSIDE)
     keep = ~remove
@@ -694,11 +724,13 @@ def run_roi_barrier_parity(*, manifest, preseal_report, output_dir,
                    'candidate_inside_kept': int(np.sum(candidate & (occupancy == INSIDE))),
                    'candidate_uncertain_kept': int(np.sum(candidate & (occupancy == UNKNOWN))),
                    'all_kept': int(keep.sum())},
-        'classification_config': {'nearest_k': int(nearest_k),
+        'classification_config': {'classifier': classifier,
+                                  'revision': REVISION if classifier != 'short-ray' else 'legacy',
+                                  'batch_size': batch_size, 'nearest_k': int(nearest_k),
                                   'min_path_agree': int(min_agree),
                                   'roi_link_samples': int(roi_link_samples),
                                   'seed_mode': str(index['summary'].get('seed_mode', 'unknown'))},
-        'short_ray': diagnostics,
+        'short_ray': diagnostics, 'distance_queries': distance_stats,
         'limitations': 'ROI Poisson barrier is NUMERICALLY audited, not mathematically watertight-certified. '
                        'Top-shell exterior requires scene verification. An unresolved query BLOCKS formal export.',
     }

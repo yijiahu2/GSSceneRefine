@@ -66,9 +66,19 @@ def load_auxiliary_mesh(path):
         raise ValueError('Invalid auxiliary triangle geometry')
     parts = trimesh.graph.connected_components(mesh.face_adjacency,
                                                  nodes=np.arange(len(f)), min_len=1)
+    boxes = []
+    for part in parts:
+        points = v[f[part]].reshape(-1, 3)
+        boxes.append((points.min(axis=0), points.max(axis=0)))
+    boxes = np.asarray(boxes)
+    if len(boxes) > 32:
+        centers = boxes.mean(axis=1)
+        order = np.argsort(centers[:, np.argmax(np.ptp(centers, axis=0))])
+        boxes = np.array([(boxes[group, 0].min(axis=0), boxes[group, 1].max(axis=0))
+                          for group in np.array_split(order, 32)])
     counts = sorted((int(len(p)) for p in parts), reverse=True)
     return mesh, {'components':len(counts), 'faces':len(f), 'vertices':len(v),
-                  'faces_per_component':counts}
+                  'faces_per_component':counts, 'component_bounds':boxes.tolist()}
 
 
 def distance_protection(model, candidate_mask, delta, mesh_path, *, chunk_size=30000,
@@ -90,19 +100,31 @@ def distance_protection(model, candidate_mask, delta, mesh_path, *, chunk_size=3
     from gsrefine.cleanup.sdf_common import _raycast
     import open3d as o3d
     scene = _raycast(o3d, mesh)
-    distances = np.empty(len(ids),np.float32)
+    from gsrefine.cleanup.threshold_distance import exact, exact_requested
+    boxes = np.asarray(info.pop('component_bounds', []))
+    guard = 64 * np.finfo(np.float32).eps * max(1., np.abs(boxes).max(initial=0), delta)
+    distances = np.full(len(ids), np.nan, np.float32)
+    force = exact_requested()
+    broad_rejected = 0
     for start in range(0,len(ids),chunk_size):
         end=min(start+chunk_size,len(ids))
         xyz = model.selected_xyz(ids[start:end])
-        q = o3d.core.Tensor(np.ascontiguousarray(xyz,dtype=np.float32),
-                            dtype=o3d.core.Dtype.Float32)
-        d = np.asarray(scene.compute_distance(q).numpy(), np.float32).reshape(-1)
-        if len(d)!=end-start or not np.isfinite(d).all() or np.any(d<0):
-            raise ValueError('Open3D returned invalid point-to-auxiliary-triangle distance')
-        distances[start:end]=d
-        protected[ids[start:end]]=d.astype(np.float64)<=delta
+        # Beyond the padded auxiliary AABB the nearest triangle is also too far.
+        xyz = np.asarray(xyz, dtype=np.float32).astype(np.float64)
+        possible = np.full(len(xyz), force or not len(boxes))
+        if not possible.all():
+            for lo, hi in boxes:
+                # Expanded box contains the entire Euclidean threshold neighbourhood.
+                possible |= np.all((xyz >= lo - delta - guard) & (xyz <= hi + delta + guard), axis=1)
+        broad_rejected += int((~possible).sum())
+        if possible.any():
+            d = exact(scene, o3d, xyz[possible])
+            distances[start:end][possible] = d
+            protected[ids[start:end][possible]] = d.astype(np.float64) <= delta
         if progress is not None:
             progress(end,len(ids))
+    info.update(aabb_rejected=broad_rejected, exact_queries=len(ids)-broad_rejected,
+                distance_nan='ruled out by padded auxiliary bounding box')
     return protected, info, distances
 
 

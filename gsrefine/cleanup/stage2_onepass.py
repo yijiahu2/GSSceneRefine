@@ -15,29 +15,23 @@ Stage-2 shared geometry caches remain in their canonical ROI-run cleanup paths.
 """
 from __future__ import annotations
 
+import csv
 import argparse
 from datetime import datetime, timezone
 import json
 from pathlib import Path
 import os
 import tempfile
-import hashlib
 
 import numpy as np
+
+from gsrefine.cleanup.stage2_runtime import file_digest as _sha, measured, run_scope, snapshot
 
 REVISION = 'GSSceneRefine.stage2_onepass_r3_parity_aux_protection.v1'
 
 
 def _log(message):
     print('[stage2-onepass] ' + str(message), flush=True)
-
-
-def _sha(path):
-    h = hashlib.sha256()
-    with Path(path).open('rb') as stream:
-        for block in iter(lambda: stream.read(4 << 20), b''):
-            h.update(block)
-    return h.hexdigest()
 
 
 def _read(path):
@@ -122,8 +116,9 @@ def _find_barrier_audit(roi_run, stage1_manifest, r3_handoff, original_poisson):
     return sorted(candidates,key=lambda x:(x[0],x[1]))[0][2] if candidates else None
 
 
+@measured('validated_parity')
 def _validated_parity(parity_dir, model, source, preseal_report, original_poisson, *,
-                      nearest_k=None, min_path_agree=None):
+                      nearest_k=None, min_path_agree=None, classifier=None, chunk_size=30000):
     """Do not combine a spatial result from another ROI / Poisson / Gaussian method."""
     from gsrefine.cleanup.auxiliary_protection import load_validated_parity
     parity_dir = Path(parity_dir).resolve(strict=True)
@@ -156,10 +151,21 @@ def _validated_parity(parity_dir, model, source, preseal_report, original_poisso
                 config.get('min_path_agree') != int(min_path_agree) or
                 config.get('roi_link_samples') != 3):
             raise ValueError('Parity cache uses different/unknown classification settings; recompute')
+    if classifier is not None:
+        from gsrefine.cleanup.adaptive_voxel import REVISION as voxel_revision
+        settings = report.get('classification_config', {})
+        if settings.get('classifier', 'short-ray') != classifier:
+            raise ValueError('Cached candidate classifier differs from the requested one')
+        if classifier != 'short-ray' and settings.get('revision') != voxel_revision:
+            raise ValueError('Incompatible voxel classifier revision')
+        if nearest_k is not None and 'batch_size' in settings:
+            if settings['batch_size'] != max(500, chunk_size // nearest_k):
+                raise ValueError('Cached candidate query batch size differs')
     # Source model fields must match native 3DGS, not an XYZ-only converted PLY.
     return outside, over, delta, report, report_file, mask_file
 
 
+@measured('auxiliary_protection')
 def _auxiliary_protection(model, candidate, delta, auxiliary_path, *, chunk_size=30000):
     """Invoke reusable core protection, not a research-only ablation script."""
     from gsrefine.cleanup.auxiliary_protection import distance_protection
@@ -168,7 +174,7 @@ def _auxiliary_protection(model, candidate, delta, auxiliary_path, *, chunk_size
         step=(10*n)//max(total,1)
         if step!=last[0] or n==total:
             last[0]=step
-            _log(f'Auxiliary exact triangle distances {n:,}/{total:,}')
+            _log(f'Auxiliary protection candidates checked {n:,}/{total:,}')
     return distance_protection(model, candidate, delta, auxiliary_path,
                                chunk_size=chunk_size, progress=progress)
 
@@ -192,6 +198,7 @@ def _combine_removal(outside, over, protected, *, uncertain_count, all_gaussians
     return keep, remove
 
 
+@measured('export_native')
 def _export_native(model, mask, outfile):
     """Preserve ALL SH/color/opacity/scale/rotation bytes for SuperSplat."""
     from gsrefine.cleanup.auxiliary_protection import export_native_gaussian
@@ -226,19 +233,19 @@ def _source_order_preseal(report):
         return False
 
 
-def _discover_preseal(manifest, run_dir):
+def _discover_preseal(manifest, run_dir, return_checked=False):
     """Auto-reuse only a uniquely authenticated full-core canonical R3 preseal."""
     root = Path(run_dir)/'cleanup/geometry/direct_r3_sdf'
     if not root.is_dir():
         return None
     from gsrefine.cleanup.stage2_geometry_validation import validate_parity_geometry
-    accepted=[]
+    accepted={}
     for report in sorted(root.glob('*/preseal_diagnostics.json')):
         try:
-            validate_parity_geometry(manifest, report)
+            checked = validate_parity_geometry(manifest, report)
             if not _source_order_preseal(report):
                 continue
-            accepted.append(report)
+            accepted[report] = checked
         except (ValueError, FileNotFoundError, KeyError, RuntimeError, OSError):
             continue
     if len(accepted)>1:
@@ -256,14 +263,18 @@ def _discover_preseal(manifest, run_dir):
         if len(signatures)==1:
             _log(f'Found {len(accepted)} equivalent authenticated geometry records; '
                  'reusing one identical main/aux/SfM result')
-            return accepted[0]
-        raise ValueError('Several DIFFERENT authenticated main/aux/SfM geometries exist for this ROI. '
+        else:
+            raise ValueError('Several DIFFERENT authenticated main/aux/SfM geometries exist for this ROI. '
                          'Do not guess; supply --preseal-report for a reviewed geometry version. '
                          'Candidates: '+', '.join(str(x) for x in accepted))
-    return accepted[0] if accepted else None
+    if not accepted:
+        return None
+    selected = next(iter(accepted))
+    return (selected, accepted[selected]) if return_checked else selected
 
 
-def _discover_parity(run_dir, source, preseal, global_poisson, model, *, nearest_k=8, min_path_agree=2):
+@measured('discover_parity')
+def _discover_parity(run_dir, source, preseal, global_poisson, model, *, nearest_k=8, min_path_agree=2, classifier=None, chunk_size=30000):
     """Reusable proven V2 classification is selected by geometry and model provenance."""
     root = Path(run_dir)/'cleanup'
     matches=[]
@@ -273,8 +284,12 @@ def _discover_parity(run_dir, source, preseal, global_poisson, model, *, nearest
                 data = _read(report)
                 if data.get('schema') != 'GSSceneRefine.roi_barrier_parity_sdf.v3':
                     continue
+                cached = data.get('classification_config', {}).get('classifier', 'short-ray')
+                if classifier is not None and cached != classifier:
+                    continue
                 _validated_parity(report.parent,model,source,preseal,global_poisson,
-                                  nearest_k=nearest_k,min_path_agree=min_path_agree)
+                                  nearest_k=nearest_k,min_path_agree=min_path_agree,
+                                  classifier=classifier,chunk_size=chunk_size)
                 if data.get('classification_config',{}).get('seed_mode') != (
                         'single highest R3 shell node (researcher must verify exterior)'):
                     continue
@@ -293,6 +308,7 @@ def _discover_parity(run_dir, source, preseal, global_poisson, model, *, nearest
     return matches[0] if matches else None
 
 
+@measured('prepare_required_geometry')
 def _prepare_required_geometry(manifest, run_dir, *, preseal_report=None):
     """One command: missing SfM, direct R3 clipping and preseal are built automatically."""
     from gsrefine.cleanup.sdf_common import _load_stage1_manifest
@@ -300,12 +316,16 @@ def _prepare_required_geometry(manifest, run_dir, *, preseal_report=None):
     if Path(actual_run_dir).resolve() != Path(run_dir).resolve():
         raise ValueError('Stage-1 run directory changed')
     preflight = _existing_preseal(stage1, run_dir, optional_preseal=preseal_report)
+    checked = None
     if preflight is None:
-        preflight = _discover_preseal(stage1, run_dir)
+        discovered = _discover_preseal(stage1, run_dir, True)
+        if discovered is not None:
+            preflight, checked = discovered
     if preflight is not None:
         # This is mandatory also when the user explicitly supplies a path.
         from gsrefine.cleanup.stage2_geometry_validation import validate_parity_geometry
-        checked = validate_parity_geometry(stage1, preflight)
+        if checked is None:
+            checked = validate_parity_geometry(stage1, preflight)
         _log('Reusing authenticated, full-core SEALLESS R3 main/aux geometry: ' + str(preflight))
         return preflight, {'status':'VALIDATED_SEALLESS_DISTANCE_GEOMETRY_REUSED',
                            'sealless_geometry_validation':checked['summary']}
@@ -315,12 +335,12 @@ def _prepare_required_geometry(manifest, run_dir, *, preseal_report=None):
     from gsrefine.geometry.r3_direct_poisson_clip import run as run_direct_clip
     from gsrefine.cleanup.direct_r3_pipeline import run as run_r3_check
     _log('1/5 Preparing/validating full post-R3 SfM support')
-    sfm_file, sfm_report, sfm_reused = resolve_stage2_r3_sfm(run_dir, upstream, inputs)
+    sfm_file, sfm_report, sfm_reused = measured('resolve_stage2_r3_sfm')(resolve_stage2_r3_sfm)(run_dir, upstream, inputs)
     _log('2/5 Preparing/validating R3-clipped ORIGINAL global Poisson')
     clip = run_direct_clip(manifest=stage1, fit_max_points=60000)
     clip_report = Path(clip['candidate_mesh']).parent / 'clip_comparison_report.json'
     _log('3/5 Preparing/validating main and auxiliary Poisson partition + FULL SfM P95')
-    result = run_r3_check(manifest=stage1, phase='check', clip_report=str(clip_report))
+    result = measured('run_r3_check')(run_r3_check)(manifest=stage1, phase='check', clip_report=str(clip_report))
     preflight = Path(result['preseal_report']).resolve(strict=True)
     # Historical phase=check can return BLOCKED_PRESEAL when a complex R3
     # produces multiple open rings. That verdict applied ONLY to artificial
@@ -339,7 +359,7 @@ def _prepare_required_geometry(manifest, run_dir, *, preseal_report=None):
 def _run_parity(manifest, preseal, output_dir, *, audit_dir=None,
                 index_cache=None, exterior_seed=None,
                 nearest_k=8, min_path_agree=2, ray_batch=8000,
-                chunk_size=30000):
+                chunk_size=30000, classifier="adaptive-voxel"):
     from gsrefine.cleanup.roi_barrier_parity import run_roi_barrier_parity
     _log('4/5 Classifying all above-threshold Gaussian centres via ROI barrier parity')
     result = run_roi_barrier_parity(
@@ -349,17 +369,18 @@ def _run_parity(manifest, preseal, output_dir, *, audit_dir=None,
         classification_only=True, confirm_exterior=False,
         exterior_seed=exterior_seed, nearest_k=int(nearest_k),
         min_agree=int(min_path_agree), ray_batch=int(ray_batch),
-        chunk_size=int(chunk_size))
+        chunk_size=int(chunk_size), classifier=classifier)
     if result.get('status') != 'CLASSIFICATION_ONLY_PREVIEW':
         raise RuntimeError('Parity classification did not finish normally: ' + str(result))
     return result
 
 
+@run_scope
 def run(*, manifest, output_dir, preseal_report=None, barrier_audit_dir=None,
         parity_dir=None, index_cache=None, exterior_seed=None,
         accept_auto_exterior=False, reclassify=False, chunk_size=30000, nearest_k=8,
         min_path_agree=2, ray_batch=8000, export_auxiliary_preview=True,
-        keep_classification_previews=False, auxiliary_protection_enabled=True):
+        keep_classification_previews=False, auxiliary_protection_enabled=True, classifier=None, partition_report=None):
     """Publish a single cleaned Gaussian scene, not just detached protected fragments."""
     from gsrefine.cleanup.sdf_common import _load_stage1_manifest
     from gsrefine.roi.core import GaussianPLY
@@ -373,9 +394,20 @@ def run(*, manifest, output_dir, preseal_report=None, barrier_audit_dir=None,
     if parity_dir is not None and exterior_seed is not None:
         raise ValueError('A precomputed parity index already has its exterior seed; '
                          'do not supply a different seed without rebuilding the index')
+    from gsrefine.cleanup.adaptive_voxel import CLASSIFIERS
+    if classifier is None and parity_dir is None:
+        classifier = 'adaptive-voxel'
+    if classifier is not None and classifier not in (*CLASSIFIERS, 'local-region', 'original-region'):
+        raise ValueError(f'Unknown candidate classifier: {classifier}')
+    if partition_report is not None and classifier != 'original-region':
+        raise ValueError('--partition-report requires --classifier original-region')
     stage1, upstream, inputs, run_dir = _load_stage1_manifest(manifest)
     dest_dir = _validate_output(output_dir, run_dir, inputs['gaussian_ply'])
-    if barrier_audit_dir is not None:
+    if classifier in ('local-region', 'original-region'):
+        if any(v is not None for v in (barrier_audit_dir, parity_dir, index_cache)):
+            raise ValueError('local-region computes its own local-sheet audit; incompatible external cache')
+        audit_dir = None
+    elif barrier_audit_dir is not None:
         audit_dir = Path(barrier_audit_dir).expanduser().resolve(strict=True)
     else:
         from gsrefine.geometry.r3_direct_poisson_clip import _source_r3_handoff
@@ -393,6 +425,16 @@ def run(*, manifest, output_dir, preseal_report=None, barrier_audit_dir=None,
         # Keep the verified sealless geometry preflight when a later barrier
         # or parity check rejects this scene (diagnostic only, never a clean PLY).
         _atomic_json(diagnostics / 'sealless_geometry_validation.json', geometry_info)
+        if classifier in ('local-region', 'original-region'):
+            from gsrefine.cleanup.local_region_pipeline import run as run_local
+            if classifier == 'original-region':
+                from gsrefine.cleanup.original_partition import select_report
+                partition_report = select_report(run_dir, stage1, inputs, partition_report)
+            return run_local(stage1, preseal, dest_dir, GaussianPLY(inputs['gaussian_ply']),
+                             seed=exterior_seed, chunk=chunk_size, nearest_k=nearest_k,
+                             min_agree=min_path_agree, protect=auxiliary_protection_enabled,
+                             previews=keep_classification_previews, aux_preview=export_auxiliary_preview, partition_report=partition_report,
+                             original_mode=classifier == 'original-region')
         # After geometry generation, a previously missing R3 handoff may now exist.
         if audit_dir is None and barrier_audit_dir is None:
             from gsrefine.geometry.r3_direct_poisson_clip import _source_r3_handoff
@@ -402,18 +444,22 @@ def run(*, manifest, output_dir, preseal_report=None, barrier_audit_dir=None,
         if parity_dir is None and not reclassify and exterior_seed is None:
             parity_dir = _discover_parity(run_dir, inputs['gaussian_ply'], preseal,
                                           inputs['poisson_mesh'], model,
-                                          nearest_k=nearest_k, min_path_agree=min_path_agree)
+                                          nearest_k=nearest_k, min_path_agree=min_path_agree,
+                                          classifier=classifier, chunk_size=chunk_size)
         parity_path = Path(parity_dir).expanduser().resolve(strict=True) if parity_dir else diagnostics/'parity'
         if parity_dir is None:
             _run_parity(stage1, preseal, parity_path, audit_dir=audit_dir,
                         index_cache=index_cache, exterior_seed=exterior_seed,
                         nearest_k=nearest_k, min_path_agree=min_path_agree,
-                        ray_batch=ray_batch, chunk_size=chunk_size)
+                        ray_batch=ray_batch, chunk_size=chunk_size, classifier=classifier)
         else:
             _log('4/5 Reusing source-checked parity classification: ' + str(parity_path))
         outside, over, delta, parity_record, report_file, masks_file = _validated_parity(
             parity_path, model, inputs['gaussian_ply'], preseal, inputs['poisson_mesh'],
-            nearest_k=nearest_k, min_path_agree=min_path_agree)
+            nearest_k=nearest_k, min_path_agree=min_path_agree,
+            classifier=classifier, chunk_size=chunk_size)
+        if classifier is None:
+            classifier = parity_record.get('classification_config', {}).get('classifier', 'short-ray')
         nav = parity_record.get('geometry',{}).get('navigation',{})
         if int(nav.get('known_outside_nodes',0)) == 0 or int(nav.get('known_inside_nodes',0)) == 0:
             raise RuntimeError('Parity classification has no two-sided partition')
@@ -482,7 +528,7 @@ def run(*, manifest, output_dir, preseal_report=None, barrier_audit_dir=None,
                 'stage1_roi':'verified final R3 1x',
                 'space_wall':'original full-scene Poisson largest connected body',
                 'distance_surface':'R3-clipped main Poisson original triangles',
-                'spatial_classifier':'ROI constrained original-triangle parity with short-ray correction',
+                'spatial_classifier':classifier,
                 'adaptive_delta':'SfM->main Poisson P95 + P10-P90 trimmed mean of 3*major_sigma',
                 'auxiliary_rule':('protect any outside/remove candidate with unsigned d_to_any_aux_triangle <= delta' if auxiliary_protection_enabled else 'DISABLED: no auxiliary Poisson protection (ablation)'),
                 'auxiliary_protection_enabled':bool(auxiliary_protection_enabled),
@@ -498,6 +544,7 @@ def run(*, manifest, output_dir, preseal_report=None, barrier_audit_dir=None,
                 'intersection_topology':parity_record['geometry']['intersection_topology'],
                 'navigation':nav,
             },
+            'classification_performance':parity_record.get('short_ray', {}),
             'threshold':{
                 'delta':float(delta),
                 'epsilon':float(parity_record['threshold']['epsilon']),
@@ -534,6 +581,15 @@ def run(*, manifest, output_dir, preseal_report=None, barrier_audit_dir=None,
                          'uncertain_candidates.ply'):
                 (parity_path/name).unlink(missing_ok=True)
             result['outputs']['intermediate_parity_preview_gaussians_removed'] = True
+        result['stage2_timing'] = snapshot()
+        timing = result['stage2_timing']
+        with (diagnostics / 'stage2_timing.csv').open('w', encoding='utf-8-sig', newline='') as stream:
+            writer = csv.writer(stream)
+            writer.writerow(['项目', '次数', '含子步骤秒数', '独占秒数'])
+            writer.writerow(['阶段二主程序至汇总', 1, timing['total_s'], ''])
+            for name, item in timing['steps'].items():
+                writer.writerow([name, item['calls'], item['inclusive_s'], item['exclusive_s']])
+            writer.writerow(['其他', '', '', timing['other_s']])
         _atomic_json(dest_dir/'stage2_final_report.json', result)
         _log('SAVED FINAL CLEAN ROI GAUSSIAN: ' + str(dest_dir/'gaussian_roi_clean.ply'))
         _log(f'Gaussians: {model.vertex_count:,} input, {int(protected.sum()):,} aux protected, '
@@ -543,6 +599,7 @@ def run(*, manifest, output_dir, preseal_report=None, barrier_audit_dir=None,
         # Never leave an unreported final model looking like a successful result.
         if not (dest_dir/'stage2_final_report.json').is_file():
             (dest_dir/'gaussian_roi_clean.ply').unlink(missing_ok=True)
+            (dest_dir/'gaussian_roi_partial.ply').unlink(missing_ok=True)
         _atomic_json(dest_dir/'stage2_failure_report.json',
                      {'schema':REVISION, 'status':'BLOCKED_NOT_EXPORTED',
                       'created_utc':datetime.now(timezone.utc).isoformat(),
@@ -574,12 +631,15 @@ def main(argv=None):
     p.add_argument('--no-aux-preview', action='store_true', help='Skip optional auxiliary protected diagnostics PLY')
     p.add_argument('--keep-classification-previews', action='store_true',
                    help='Keep intermediate outside/inside Gaussian PLYs generated by this run; otherwise save masks only')
+    from gsrefine.cleanup.adaptive_voxel import CLASSIFIERS
+    p.add_argument("--classifier", choices=(*CLASSIFIERS, 'local-region', 'original-region'), help="Candidate side query (default: adaptive-voxel)")
+    p.add_argument("--partition-report", help="A/B report for the same ROI (auto-discovered by default)")
     a = p.parse_args(argv)
     result = run(manifest=a.manifest, output_dir=a.output_dir,
                  preseal_report=a.preseal_report, barrier_audit_dir=a.barrier_audit_dir,
                  parity_dir=a.parity_dir, index_cache=a.index_cache,
                  exterior_seed=a.exterior_seed, accept_auto_exterior=a.accept_auto_exterior,
-                 reclassify=a.reclassify,
+                 reclassify=a.reclassify, classifier=a.classifier, partition_report=a.partition_report,
                  chunk_size=a.chunk_size, nearest_k=a.nearest_k,
                  min_path_agree=a.min_path_agree, ray_batch=a.ray_batch,
                  export_auxiliary_preview=not a.no_aux_preview,

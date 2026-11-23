@@ -370,7 +370,7 @@ def analyze(mesh, roi, conf, threshold, diag, guard_cfg, up, *,
 def run(config,roi_file,output_dir, labels_file=None, *, export_ply=False,
         run_ablation=True, up_vector=None, gaussian_path=None,
         export_final=True, final_method='R3', final_only=False, progress_callback=None,
-        save_diagnostics=True, save_indices=True):
+        save_diagnostics=True, save_indices=True, accelerate_stage1=True):
     if final_only and (not run_ablation or final_method != 'R3' or export_ply):
         raise ValueError('final_only requires R3, run_ablation, and no comparison PLY exports')
     config=Path(config).resolve();cfg=yaml.safe_load(config.read_text(encoding='utf8'))
@@ -528,6 +528,8 @@ def run(config,roi_file,output_dir, labels_file=None, *, export_ply=False,
                     k_neighbors=int(cfg.get('guards',{}).get('safety_knn',128)),
                     trim_fraction=0.05,
                     safety_factor=1.0, progress_callback=progress_callback,
+                     accelerate=final_only and accelerate_stage1, full_radius_stats=save_diagnostics,
+                     roi_values=-base.min(axis=1) if final_only and accelerate_stage1 else None,
                      stage2_handoff=(dict(
                          work_dir=out, clean_sfm_npz=sfmfile,
                          roi_json=roi_file, gaussian_ply=plyfile,
@@ -582,6 +584,13 @@ def run(config,roi_file,output_dir, labels_file=None, *, export_ply=False,
     if export_ply:ply.export(basemask,out/'gaussians_R0.ply')
     report['keep_mask_sha256']={k:file_sha256(out/f'keep_mask_{k}.npy')
              for k in ((('R0','R3') if final_only else ('R0','R1','R2','R3')) if run_ablation else ('R0',))}
+    if final_only:
+        report['stage1_mask_sha256'] = {
+            'R0': report['keep_mask_sha256']['R0'],
+            'core': file_sha256(out/'core_mask_R3.npy'),
+            'safety_added': file_sha256(out/'safety_added_mask_R3.npy'),
+            'R3': report['keep_mask_sha256']['R3'],
+        }
     report['candidate']['poisson_face_scoring_enabled']=score_enabled
     report['candidate']['all_poisson_faces_trusted']=not score_enabled
     report['ablation']=ablate

@@ -30,6 +30,7 @@ from scipy.spatial import cKDTree
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra, connected_components
 import trimesh
+from gsrefine.roi import stage1_runtime
 
 LOGGER = logging.getLogger("geoguard")
 
@@ -39,6 +40,8 @@ def json_write(path, obj):
 
 
 def file_sha256(path, block=4 * 1024 * 1024):
+    if stage1_runtime.active() and block == 4 * 1024 * 1024:
+        return stage1_runtime.digest(path)
     digest=hashlib.sha256()
     with open(path, "rb") as f:
         for b in iter(lambda:f.read(block), b""):
@@ -86,7 +89,7 @@ class Projection:
     def plane(self, xyz):
         return (np.asarray(xyz,dtype=np.float64)-self.origin)@self.U.T
 
-    def signed_and_normal(self, xyz):
+    def signed_and_normal(self, xyz, *, with_normal=True):
         """Signed distance in projection model units (+ inside); nearest outward 3D unit normal.
 
         For external points the signed magnitude is a constraint violation, not
@@ -95,11 +98,12 @@ class Projection:
         q=self.plane(xyz)
         n=len(q)
         dist2=np.full(n,np.inf,dtype=np.float64)
-        nn=np.zeros((n,2),dtype=np.float64)
+        nn=np.zeros((n,2),dtype=np.float64) if with_normal else None
         inside=np.zeros(n,dtype=bool)
         poly=self.polygon
-        area2=np.sum(poly[:,0]*np.roll(poly[:,1],-1)-np.roll(poly[:,0],-1)*poly[:,1])
-        ccw=area2>0
+        if with_normal:
+            area2=np.sum(poly[:,0]*np.roll(poly[:,1],-1)-np.roll(poly[:,0],-1)*poly[:,1])
+            ccw=area2>0
         for i in range(len(poly)):
             a=poly[i]; b=poly[(i+1)%len(poly)]
             edge=b-a
@@ -112,6 +116,9 @@ class Projection:
             t=np.clip(((q-a)@edge)/L2,0,1)
             d=q-(a+t[:,None]*edge)
             v=np.einsum('ij,ij->i',d,d)
+            if not with_normal:
+                np.fmin(dist2, v, out=dist2)
+                continue
             use=v<dist2
             dist2[use]=v[use]
             if ccw: en=np.array([edge[1],-edge[0]])/np.sqrt(L2)
@@ -120,7 +127,7 @@ class Projection:
         d=np.sqrt(dist2)
         d[inside & (d<1e-10)]=0.0
         signed=np.where(inside,d,-d)
-        return signed,nn@self.U
+        return signed, nn@self.U if with_normal else None
 
 
 class ROI:
@@ -142,7 +149,10 @@ class ROI:
         result=[]
         for start in range(0,len(points),chunk):
             xyz=points[start:start+chunk]
-            sd=np.stack([v.signed_and_normal(xyz)[0] for v in self.views],axis=1)
+            if stage1_runtime.fast():
+                sd=np.stack([v.signed_and_normal(xyz, with_normal=False)[0] for v in self.views],axis=1)
+            else:
+                sd=np.stack([v.signed_and_normal(xyz)[0] for v in self.views],axis=1)
             result.append(sd)
         return np.concatenate(result,axis=0) if result else np.empty((0,len(self.views)))
 

@@ -26,7 +26,7 @@ def _read_json(path):
 
 def _load_stage1_manifest(path):
     """Verify immutable Stage-1 R3 provenance before any Stage-2 operation."""
-    from gsrefine.roi.core import file_sha256
+    from gsrefine.cleanup.stage2_runtime import file_digest as file_sha256
     manifest_file = _path(path)
     manifest = _read_json(manifest_file)
     if manifest.get('schema') != 'GSSceneRefine.output.v3' or manifest.get('status') != 'completed':
@@ -115,7 +115,7 @@ def _camera_check(o3d, scene, camera_xyz, nsamples):
 
 def _camera_path(run_dir, roi_payload, config_file, override=None):
     import yaml
-    from gsrefine.roi.core import file_sha256
+    from gsrefine.cleanup.stage2_runtime import file_digest as file_sha256
     cfg=yaml.safe_load(_path(config_file).read_text(encoding='utf8')) or {}
     candidate=override or (cfg.get('roi_init',{}).get('orientation',{}) or {}).get('colmap_images')
     if not candidate:

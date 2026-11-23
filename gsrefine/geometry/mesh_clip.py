@@ -8,7 +8,7 @@ from __future__ import annotations
 import numpy as np
 
 
-def clip_piecewise_linear(mesh, signed, *, tolerance=1e-10):
+def clip_piecewise_linear(mesh, signed, *, tolerance=1e-10, edge_roots=None):
     """Clip by interpolated vertex margin >= 0, splitting and sharing cut edges.
 
     Nonlinear R3 implicit boundaries are approximated linearly on each original
@@ -42,6 +42,8 @@ def clip_piecewise_linear(mesh, signed, *, tolerance=1e-10):
                     t = float(s[a] / (s[a] - s[b]))
                     t = float(np.clip(t, 0., 1.))
                     point = verts[a] + t * (verts[b] - verts[a])
+                    if edge_roots is not None and edge in edge_roots:
+                        point = edge_roots[edge]
                     edge_cuts[edge] = len(out_vertices)
                     out_vertices.append(point.tolist())
                 poly.append(edge_cuts[edge])

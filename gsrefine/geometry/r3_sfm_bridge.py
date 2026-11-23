@@ -10,14 +10,18 @@ required R3 geometric support from their immutable source inputs.
 """
 from __future__ import annotations
 
-import hashlib
 import json
+from dataclasses import dataclass
 import os
 import shutil
 import tempfile
 from pathlib import Path
 
 import numpy as np
+
+from gsrefine.cleanup.stage2_runtime import file_version
+from gsrefine.roi import stage1_runtime as runtime
+from gsrefine.roi.stage1_runtime import digest as sha256
 from scipy.spatial import cKDTree
 
 SCHEMA = 'GSSceneRefine.r3_sfm_handoff.v3'
@@ -29,12 +33,17 @@ SELECTION = 'exact_post_restoration_r3_safety_1x_2x'
 EPS = 1e-6
 
 
-def sha256(path):
-    h = hashlib.sha256()
-    with Path(path).open('rb') as f:
-        for block in iter(lambda: f.read(4 * 1024 * 1024), b''):
-            h.update(block)
-    return h.hexdigest()
+class _TimedZipOutput:
+    """Time writes to the buffered file separately from NumPy/ZIP processing."""
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, data):
+        with runtime.timed('npz_stream_write'):
+            return self.stream.write(data)
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
 
 
 def _npz_atomic(path, **fields):
@@ -43,7 +52,13 @@ def _npz_atomic(path, **fields):
     fd, temp = tempfile.mkstemp(prefix='.' + path.stem + '_', suffix='.npz', dir=path.parent)
     os.close(fd)
     try:
-        np.savez_compressed(temp, **fields)
+        if runtime.fast():
+            with open(temp, 'wb') as stream:
+                np.savez_compressed(_TimedZipOutput(stream), **fields)
+                with runtime.timed('npz_stream_write'):
+                    stream.flush()
+        else:
+            np.savez_compressed(temp, **fields)
         os.replace(temp, path)
     finally:
         Path(temp).unlink(missing_ok=True)
@@ -66,7 +81,7 @@ def _json_atomic(path, obj):
 
 def save_r3_sfm_handoff(*, work_dir, clean_sfm_npz, roi_json, gaussian_ply,
                         poisson_mesh, core_field, safety_config,
-                        gaussian_positions, major_axes, chunk_size=16384):
+                        gaussian_positions, major_axes, chunk_size=16384, all_tree=None):
     """Query the actual in-memory R3 field at ALL cleaned SfM positions.
 
     For Stage-B candidate Gaussians, this calls precisely the same functions
@@ -77,7 +92,7 @@ def save_r3_sfm_handoff(*, work_dir, clean_sfm_npz, roi_json, gaussian_ply,
     clean_sfm_npz, roi_json, gaussian_ply, poisson_mesh = map(
         lambda x: Path(x).resolve(strict=True),
         (clean_sfm_npz, roi_json, gaussian_ply, poisson_mesh))
-    with np.load(clean_sfm_npz, allow_pickle=False) as sfm:
+    with runtime.timed('sfm_xyz_load'), np.load(clean_sfm_npz, allow_pickle=False) as sfm:
         xyz = np.asarray(sfm['xyz'], dtype=np.float64)
     if xyz.ndim != 2 or xyz.shape[1] != 3 or not len(xyz) or not np.isfinite(xyz).all():
         raise ValueError('Invalid cleaned SfM xyz; cannot export exact R3 support')
@@ -90,19 +105,32 @@ def save_r3_sfm_handoff(*, work_dir, clean_sfm_npz, roi_json, gaussian_ply,
     safety_config.validate(len(all_xyz))
     if chunk_size <= 0:
         raise ValueError('chunk_size must be positive')
-    tree = cKDTree(all_xyz)
+    tree = all_tree if all_tree is not None else cKDTree(all_xyz)
     field_distance = np.empty(len(xyz), dtype=np.float64)
     local_r = np.empty(len(xyz), dtype=np.float64)
     projection_error = np.empty(len(xyz), dtype=np.float64)
     for a in range(0, len(xyz), chunk_size):
         b = min(a + chunk_size, len(xyz))
         pts = xyz[a:b]
-        dist = np.asarray(core_field.evaluate(pts), dtype=np.float64)
-        boundary, residual = _project_to_boundary(core_field, pts, safety_config)
-        radii = trimmed_knn_mean(tree, axes, boundary,
-                                 k=safety_config.k_neighbors,
-                                 trim_fraction=safety_config.trim_fraction,
-                                 batch_size=safety_config.batch_size)
+        with runtime.timed('sfm_field_evaluation'):
+            dist = np.asarray(core_field.evaluate(pts), dtype=np.float64)
+        with runtime.timed('sfm_boundary_projection'):
+            if runtime.fast():
+                boundary, residual = _project_to_boundary(core_field, pts, safety_config, initial_values=dist)
+            else:
+                boundary, residual = _project_to_boundary(core_field, pts, safety_config)
+        with runtime.timed('sfm_axis_knn'):
+            if runtime.fast():
+                # The entire input was already validated above; avoid a full-axis
+                # scan for each SfM chunk.
+                from gsrefine.roi.two_stage_sdf import _query_trimmed_axes
+                radii = _query_trimmed_axes(tree, axes, boundary, safety_config.k_neighbors,
+                                            safety_config.trim_fraction, safety_config.batch_size)
+            else:
+                radii = trimmed_knn_mean(tree, axes, boundary,
+                                         k=safety_config.k_neighbors,
+                                         trim_fraction=safety_config.trim_fraction,
+                                         batch_size=safety_config.batch_size)
         if (dist.shape != (len(pts),) or radii.shape != (len(pts),)
                 or not np.isfinite(dist).all() or not np.isfinite(radii).all()
                 or np.any(radii <= 0) or not np.isfinite(residual).all()):
@@ -117,7 +145,7 @@ def save_r3_sfm_handoff(*, work_dir, clean_sfm_npz, roi_json, gaussian_ply,
     target = work_dir / WORK_NAME
     if target.exists():
         raise FileExistsError('Already have a R3 SfM handoff in this work directory: ' + str(target))
-    _npz_atomic(target, schema=np.array(SCHEMA), semantics=np.array(SEMANTICS),
+    fields = dict(schema=np.array(SCHEMA), semantics=np.array(SEMANTICS),
                 cleaned_sfm_sha256=np.array(sha256(clean_sfm_npz)),
                 roi_sha256=np.array(sha256(roi_json)),
                 source_gaussian_sha256=np.array(sha256(gaussian_ply)),
@@ -131,11 +159,23 @@ def save_r3_sfm_handoff(*, work_dir, clean_sfm_npz, roi_json, gaussian_ply,
                 r3_safety_factor=np.array(safety_config.safety_factor),
                 r3_distance_tolerance=np.array(safety_config.distance_tolerance),
                 r3_projection_tolerance=np.array(safety_config.projection_tolerance))
+    with runtime.timed('handoff_npz_write'):
+        _npz_atomic(target, **fields)
     return target
 
 
-def read_verified_handoff(record, *, clean_sfm_npz, roi_json, gaussian_ply,
-                          poisson_mesh):
+@dataclass
+class _VerifiedHandoff:
+    distance: np.ndarray
+    radius: np.ndarray
+    tolerance: float
+    sources: dict
+    residual: np.ndarray
+    projection_tolerance: float
+    clean_xyz: np.ndarray | None = None
+
+
+def _load_verified_handoff(record, *, clean_sfm_npz, roi_json, gaussian_ply, poisson_mesh, keep_xyz=False):
     expected = dict(cleaned_sfm_sha256=sha256(clean_sfm_npz), roi_sha256=sha256(roi_json),
                     source_gaussian_sha256=sha256(gaussian_ply),
                     source_poisson_sha256=sha256(poisson_mesh))
@@ -145,7 +185,7 @@ def read_verified_handoff(record, *, clean_sfm_npz, roi_json, gaussian_ply,
                     'r3_projection_tolerance',
                     'r3_trim_each_tail', 'r3_safety_factor', 'r3_knn',
                     'projection_residual', *expected.keys())
-        if any(key not in data for key in required):
+        if not set(required).issubset(data.files):
             raise ValueError('Incomplete R3 v3 handoff')
         if data['schema'].item() != SCHEMA or data['semantics'].item() != SEMANTICS:
             raise ValueError('Not a post-restoration R3 handoff; old initial-ROI v2 is not accepted')
@@ -155,18 +195,28 @@ def read_verified_handoff(record, *, clean_sfm_npz, roi_json, gaussian_ply,
         r = np.asarray(data['safety_distance_per_sfm_point'], dtype=np.float64)
         tol = float(data['r3_distance_tolerance'].item())
         n = int(data['point_count'].item())
+        residual = data['projection_residual']
+        projection_tol = float(data['r3_projection_tolerance'].item())
         if (not np.isclose(float(data['r3_trim_each_tail'].item()), .05, atol=1e-12)
                 or not np.isclose(float(data['r3_safety_factor'].item()), 1., atol=1e-12)
                 or int(data['r3_knn'].item()) < 3
-                or not np.isfinite(data['projection_residual']).all()):
+                or residual.shape != (n,) or not np.isfinite(residual).all()
+                or not np.isfinite(projection_tol) or projection_tol < 0):
             raise ValueError('R3 v3 safety metadata differs from Stage-1 fixed 5%/1x scheme')
     with np.load(clean_sfm_npz, allow_pickle=False) as data:
-        xyz_n = len(data['xyz'])
+        xyz = data['xyz']
+        xyz_n = len(xyz)
     if (n != xyz_n or d.shape != (n,) or r.shape != (n,)
             or not np.isfinite(d).all() or not np.isfinite(r).all()
             or np.any(r <= 0) or not np.isfinite(tol) or tol < 0):
         raise ValueError('Malformed or wrong-length R3 spatial field for cleaned SfM')
-    return d, r, tol, expected
+    return _VerifiedHandoff(d, r, tol, expected, residual, projection_tol, xyz if keep_xyz else None)
+
+
+def read_verified_handoff(record, *, clean_sfm_npz, roi_json, gaussian_ply, poisson_mesh):
+    fields = _load_verified_handoff(record, clean_sfm_npz=clean_sfm_npz, roi_json=roi_json,
+                                    gaussian_ply=gaussian_ply, poisson_mesh=poisson_mesh)
+    return fields.distance, fields.radius, fields.tolerance, fields.sources
 
 
 def select_verified_clean_sfm(clean_sfm_npz, roi_json, gaussian_ply, poisson_mesh,
@@ -175,20 +225,28 @@ def select_verified_clean_sfm(clean_sfm_npz, roi_json, gaussian_ply, poisson_mes
     d, r, tol, source_hashes = read_verified_handoff(
         handoff_file, clean_sfm_npz=clean_sfm_npz, roi_json=roi_json,
         gaussian_ply=gaussian_ply, poisson_mesh=poisson_mesh)
+    with np.load(handoff_file, allow_pickle=False) as rec:
+        residual = np.asarray(rec['projection_residual'])
+        projection_tolerance = float(rec['r3_projection_tolerance'].item())
+    fields = _VerifiedHandoff(d, r, tol, source_hashes, residual, projection_tolerance)
+    return _select_clean_rows(fields, clean_sfm_npz, handoff_file)
+
+
+def _select_clean_rows(fields, clean_sfm_npz, handoff_file):
+    d, r, tol = fields.distance, fields.radius, fields.tolerance
+    residual, projection_tolerance = fields.residual, fields.projection_tolerance
+    source_hashes = fields.sources
     core = d <= r + tol
     build = d <= 2.0 * r + tol
     if not np.all(~core | build):
         raise AssertionError('2x R3 support must contain 1x core')
     if core.sum() < 100:
         raise ValueError(f'Only {int(core.sum())} core cleaned SfM points; need >=100')
-    with np.load(handoff_file, allow_pickle=False) as rec:
-        residual = np.asarray(rec['projection_residual'])
-        projection_tolerance = float(rec['r3_projection_tolerance'].item())
     selected = {}
     with np.load(clean_sfm_npz, allow_pickle=False) as sfm:
         n = len(d)
         for key in sfm.files:
-            value = np.asarray(sfm[key])
+            value = fields.clean_xyz if key == "xyz" and fields.clean_xyz is not None else np.asarray(sfm[key])
             if value.ndim and len(value) == n:
                 selected[key] = value[build]
             elif value.ndim == 0:
@@ -223,13 +281,20 @@ def select_verified_clean_sfm(clean_sfm_npz, roi_json, gaussian_ply, poisson_mes
 
 
 def create_roi_sfm_v3(*, clean_sfm_npz, roi_json, gaussian_ply, poisson_mesh,
-                      handoff_file, output_npz, output_report):
+                      handoff_file, output_npz, output_report, _verified=None):
     result = Path(output_npz)
     metadata = Path(output_report)
     provenance = dict(clean_sfm_sha256=sha256(clean_sfm_npz), roi_sha256=sha256(roi_json),
                       original_gaussian_sha256=sha256(gaussian_ply),
                       source_poisson_sha256=sha256(poisson_mesh),
                       handoff_sha256=sha256(handoff_file))
+    if _verified is not None:
+        verified, verified_sha = _verified
+        if (verified_sha != provenance['handoff_sha256'] or verified.sources != dict(
+                cleaned_sfm_sha256=provenance['clean_sfm_sha256'], roi_sha256=provenance['roi_sha256'],
+                source_gaussian_sha256=provenance['original_gaussian_sha256'],
+                source_poisson_sha256=provenance['source_poisson_sha256'])):
+            raise ValueError('Published SfM handoff or inputs changed after verification')
     if result.exists() or metadata.exists():
         if not result.is_file() or not metadata.is_file():
             raise FileExistsError('Incomplete v3 ROI SfM publication: ' + str(result))
@@ -238,10 +303,15 @@ def create_roi_sfm_v3(*, clean_sfm_npz, roi_json, gaussian_ply, poisson_mesh,
                 or old.get('sfm_roi_sha256') != sha256(result)):
             raise ValueError('Existing ROI SfM belongs to a different algorithm/source')
         return result.resolve(), old
-    records, report = select_verified_clean_sfm(clean_sfm_npz, roi_json,
-                               gaussian_ply, poisson_mesh, handoff_file)
+    with runtime.timed('publication_select_sfm_rows'):
+        if _verified is None:
+            records, report = select_verified_clean_sfm(clean_sfm_npz, roi_json, gaussian_ply,
+                                                       poisson_mesh, handoff_file)
+        else:
+            records, report = _select_clean_rows(_verified[0], clean_sfm_npz, handoff_file)
     report['sources'] = provenance
-    _npz_atomic(result, **records)
+    with runtime.timed('publication_sfm_npz_write'):
+        _npz_atomic(result, **records)
     report['sfm_roi_sha256'] = sha256(result)
     try:
         _json_atomic(metadata, report)
@@ -264,26 +334,41 @@ def publish_stage1_r3_sfm(*, downstream, metadata_dir, work_dir, gaussian_source
     # Full Gaussian input, NOT the final Gaussian ROI.
     original = downstream['source_full_gaussian_ply']
     poisson = downstream['poisson_mesh']
-    read_verified_handoff(source, clean_sfm_npz=clean, roi_json=roi,
-                          gaussian_ply=original, poisson_mesh=poisson)
+    verified = None
+    inputs = dict(clean_sfm_npz=clean, roi_json=roi, gaussian_ply=original, poisson_mesh=poisson)
+    with runtime.timed('publication_verify_handoff'):
+        if runtime.fast():
+            version = file_version(source)
+            payload = _load_verified_handoff(source, **inputs, keep_xyz=True)
+            verified = (payload, sha256(source))
+            if file_version(source) != version:
+                raise ValueError('R3 handoff changed during verification')
+        else:
+            read_verified_handoff(source, **inputs)
     record = meta / PUBLISHED_NAME
-    if record.exists() and sha256(record) != sha256(source):
-        raise FileExistsError('Existing published R3 safety is from another source')
-    if not record.exists():
-        staging = record.with_name('.' + record.name + '.writing')
-        try:
-            shutil.copy2(source, staging)
-            os.replace(staging, record)
-        finally:
-            staging.unlink(missing_ok=True)
+    with runtime.timed('publication_copy_handoff'):
+        if record.exists() and sha256(record) != sha256(source):
+            raise FileExistsError('Existing published R3 safety is from another source')
+        if not record.exists():
+            fd, tmp = tempfile.mkstemp(prefix='.' + record.name, dir=meta)
+            os.close(fd)
+            staging = Path(tmp)
+            try:
+                shutil.copy2(source, staging)
+                if verified is not None and sha256(staging) != verified[1]:
+                    raise ValueError('Staged SfM handoff differs from verified bytes')
+                os.replace(staging, record)
+            finally:
+                staging.unlink(missing_ok=True)
     # Hash the already-written TEMP final PLY; its bytes will be identical after
     # the publisher's os.replace. The final destination need not exist yet.
-    source_final_hash = sha256(gaussian_source_file)
+    with runtime.timed('publication_final_ply_digest'):
+        source_final_hash = sha256(gaussian_source_file)
     dest, report = create_roi_sfm_v3(
         clean_sfm_npz=clean, roi_json=roi, gaussian_ply=original,
         poisson_mesh=poisson, handoff_file=record,
         output_npz=Path(downstream['gaussian_ply']).parent / 'sfm_roi.npz',
-        output_report=meta / 'roi_sfm_report_v3.json')
+        output_report=meta / 'roi_sfm_report_v3.json', _verified=verified)
     report['stage1_gaussian_roi_sha256_at_publication'] = source_final_hash
     _json_atomic(meta / 'roi_sfm_report_v3.json', report)
     downstream['r3_local_safety_npz'] = str(record.resolve())

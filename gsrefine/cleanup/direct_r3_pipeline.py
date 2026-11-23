@@ -18,6 +18,8 @@ from pathlib import Path
 
 import numpy as np
 
+from gsrefine.cleanup.stage2_runtime import file_digest as _sha
+
 REVISION = 'stage2_direct_r3_main_auxiliary_safe_tilted_seal_v5_20261109'
 # Open A+B uses its own revision and does not affect historical seal cache signatures.
 DEFAULTS = {
@@ -35,14 +37,6 @@ DEFAULTS = {
     'seal_max_tilt_deg': 25.0, 'seal_tilt_step_deg': 5.0,
     'seal_tilt_azimuths': 16, 'seal_max_tilt_trials': 8,
 }
-
-
-def _sha(path):
-    h = hashlib.sha256()
-    with Path(path).open('rb') as f:
-        for b in iter(lambda: f.read(4 * 1024 * 1024), b''):
-            h.update(b)
-    return h.hexdigest()
 
 
 def _write_json(path, value):

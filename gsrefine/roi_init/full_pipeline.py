@@ -77,6 +77,11 @@ def _parser():
     anchor = stage2.add_mutually_exclusive_group(required=True)
     anchor.add_argument('--accept-auto-exterior', action='store_true')
     anchor.add_argument('--exterior-seed', nargs=3, type=float, metavar=('X', 'Y', 'Z'))
+    from gsrefine.cleanup.adaptive_voxel import CLASSIFIERS
+    stage2.add_argument('--classifier', choices=(*CLASSIFIERS, 'local-region', 'original-region'), default='adaptive-voxel',
+                        help='Candidate side query after the Stage-2 distance threshold')
+    stage2.add_argument('--compare-stage2', help='Compare A without auxiliary protection to an existing Stage-2 result directory')
+    stage2.add_argument('--partition-report', help='Existing original-wall A/B report for this ROI')
     stage2.add_argument('--stage2-name', default='stage2_final_v1')
     stage2.add_argument('--no-aux-protection', action='store_true')
     stage2.add_argument('--no-aux-preview', action='store_true')
@@ -192,6 +197,9 @@ def _stage2_command(a, manifest, output):
                '--manifest', str(manifest), '--output-dir', str(output),
                '--chunk-size', str(a.chunk_size), '--nearest-k', str(a.nearest_k),
                '--min-path-agree', str(a.min_path_agree), '--ray-batch', str(a.ray_batch)]
+    command.extend(['--classifier', a.classifier])
+    if getattr(a, 'partition_report', None):
+        command.extend(['--partition-report', str(a.partition_report)])
     if a.accept_auto_exterior:
         command.append('--accept-auto-exterior')
     if a.exterior_seed is not None:
@@ -205,8 +213,15 @@ def _stage2_command(a, manifest, output):
 def _validate_stage2_completed(output, manifest, inputs):
     report_path = output / 'stage2_final_report.json'
     report = _read_json(report_path)
-    clean = (output / 'gaussian_roi_clean.ply').resolve(strict=True)
-    if report.get('status') != 'COMPLETED_EXPERIMENTAL_CLEAN_ROI_GAUSSIAN' or not clean.stat().st_size:
+    status = report.get('status')
+    allowed = {'COMPLETED_EXPERIMENTAL_CLEAN_ROI_GAUSSIAN':output/'gaussian_roi_clean.ply'}
+    if report.get('schema') == 'GSSceneRefine.local_region.v1':
+        allowed.update(PARTIAL_VERIFIED_ROI_CLEANUP=output/'gaussian_roi_partial.ply',
+                       NO_VERIFIED_CLEANUP_SCOPE=inputs['gaussian_ply'])
+    if status not in allowed:
+        raise RuntimeError('Invalid Stage-2 terminal status')
+    clean = allowed[status].resolve(strict=True)
+    if not clean.stat().st_size:
         raise RuntimeError('Stage 2 did not report a completed nonempty Gaussian ROI')
     upstream = report.get('input', {})
     published = report.get('outputs', {})
@@ -273,12 +288,14 @@ def run(a):
             raise RuntimeError(f'阶段二进程退出码={proc.returncode}；'
                                '参见本次输出目录下的stage2_failure_report.json')
         report, clean = _validate_stage2_completed(stage2_dir, manifest, inputs)
-        state = _write_state(roi_run, 'COMPLETED', manifest, stage2_dir,
+        terminal = 'COMPLETED' if report['status']=='COMPLETED_EXPERIMENTAL_CLEAN_ROI_GAUSSIAN' else report['status']
+        state = _write_state(roi_run, terminal, manifest, stage2_dir,
                              extra={'stage1_status': 'COMPLETED', 'resume': bool(a.resume_manifest),
-                                    'cleaned_gaussian': str(clean),
+                                    {'COMPLETED':'cleaned_gaussian', 'PARTIAL_VERIFIED_ROI_CLEANUP':'partially_cleaned_gaussian',
+                                     'NO_VERIFIED_CLEANUP_SCOPE':'retained_stage1_gaussian'}[terminal]: str(clean),
                                     'stage2_report': str(stage2_dir/'stage2_final_report.json'),
                                     'counts': report.get('counts', {})})
-        print('[full-pipeline] Both stages completed: ' + str(clean), flush=True)
+        print('[full-pipeline] '+terminal+' '+str(clean), flush=True)
         return state
     except BaseException as exc:
         _write_state(roi_run, 'STAGE2_FAILED', manifest, stage2_dir,
@@ -290,7 +307,14 @@ def run(a):
 def main(argv=None):
     a = _parser().parse_args(argv)
     try:
-        run(a)
+        from time import perf_counter
+        if a.compare_stage2 and (a.classifier != 'original-region' or not a.no_aux_protection):
+            raise ValueError('--compare-stage2 needs --classifier original-region --no-aux-protection')
+        start = perf_counter()
+        state = run(a)
+        if a.compare_stage2:
+            from gsrefine.cleanup.compare_original_region import compare
+            compare(Path(state['stage2_output_dir']), a.compare_stage2, perf_counter()-start)
     except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
         print('[full-pipeline] STOPPED: ' + str(exc), file=sys.stderr, flush=True)
         raise SystemExit(1) from exc

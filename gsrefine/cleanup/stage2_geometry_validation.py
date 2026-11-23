@@ -9,11 +9,12 @@ validators. They are never imported or executed by this module.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
 import numpy as np
+
+from gsrefine.cleanup.stage2_runtime import file_digest as _digest, file_version, measured, reuse
 
 STAGE2_GEOMETRY_VALIDATION = 'GSSceneRefine.sealless_stage2_geometry.v1'
 # These are the SAME mathematical parameters previously used by Stage-2.
@@ -23,14 +24,6 @@ GAUSSIAN_DISTANCE_DEFAULTS = {
     'sigma_multiplier': 3.0,
     'epsilon': 1e-5,
 }
-
-
-def _digest(path):
-    h = hashlib.sha256()
-    with Path(path).open('rb') as reader:
-        for block in iter(lambda: reader.read(4 << 20), b''):
-            h.update(block)
-    return h.hexdigest()
 
 
 def _finite_nonnegative(value, name):
@@ -61,7 +54,6 @@ def validate_parity_geometry(manifest, geometry_report, *, config_file=None):
     """
     from gsrefine.cleanup.sdf_common import _load_stage1_manifest
     from gsrefine.cleanup.direct_r3_pipeline import select_direct_r3_clip, validate_sources
-    import trimesh
 
     stage1, upstream, inputs, run_dir = _load_stage1_manifest(manifest)
     stage1 = Path(stage1).resolve(strict=True)
@@ -71,11 +63,43 @@ def validate_parity_geometry(manifest, geometry_report, *, config_file=None):
     if not report_file.is_relative_to(trusted_root) or report_file.name != 'preseal_diagnostics.json':
         raise ValueError('Sealless Stage-2: geometry report must be an authenticated '
                          'preseal_diagnostics.json inside this ROI run/cleanup/geometry/direct_r3_sdf')
+    report_version = file_version(report_file)
     record = json.loads(report_file.read_text(encoding='utf-8'))
     if record.get('schema') != 'GSSceneRefine.direct_r3_stage2.v1':
         raise ValueError('Sealless Stage-2: unsupported main/aux geometry report schema')
     if Path(record.get('stage1_manifest') or '/invalid/source').resolve() != stage1:
         raise ValueError('Sealless Stage-2: geometry report refers to a DIFFERENT Stage-1 ROI manifest')
+
+    # Ensure the local R3 mesh was extracted directly from the SAME original
+    # global Poisson, R3 field and cleaned SfM as the manifest, with no rebuild.
+    raw, _, clip = select_direct_r3_clip(
+        run_dir, selected_report=record['direct_r3_clip_report'])
+    if Path(raw).resolve(strict=True) != Path(record['observed_direct_r3_mesh']).resolve(strict=True):
+        raise ValueError('Sealless Stage-2: direct-R3 source mesh differs from geometry report')
+    sfm_path = Path(record['sfm']).resolve(strict=True)
+    validate_sources(stage1, upstream, inputs, run_dir, clip, sfm_path)
+
+    cfgpath = (Path(config_file).resolve(strict=True) if config_file
+               else (run_dir / 'metadata' / 'effective_scene.yaml').resolve(strict=True))
+    if file_version(report_file) != report_version:
+        raise ValueError('Geometry report changed during source verification')
+    files = [stage1, cfgpath, *inputs.values(), record['main_observed_surface']]
+    if record.get('auxiliary_observed_surface'):
+        files.append(record['auxiliary_observed_surface'])
+    versions = tuple(file_version(path) for path in files)
+
+    def load():
+        checked = _validate_local_geometry(record, inputs, run_dir, report_file, cfgpath)
+        if file_version(report_file) != report_version or tuple(file_version(path) for path in files) != versions:
+            raise ValueError('Geometry input changed during validation')
+        return checked
+
+    return reuse(('validated_local_geometry', report_version, versions), load)
+
+
+@measured('validate_local_geometry')
+def _validate_local_geometry(record, inputs, run_dir, report_file, cfgpath):
+    import trimesh
 
     fit = record.get('sfm_fit') or {}
     p95 = _finite_nonnegative(fit.get('p95'), 'full-core SfM P95')
@@ -99,15 +123,6 @@ def validate_parity_geometry(manifest, geometry_report, *, config_file=None):
                          'R3-clipped, main-connected body in this report directory')
     if _digest(mesh_file) != record.get('main_observed_surface_sha256'):
         raise ValueError('Sealless Stage-2: main Poisson PLY changed (SHA256 mismatch)')
-
-    # Ensure the local R3 mesh was extracted directly from the SAME original
-    # global Poisson, R3 field and cleaned SfM as the manifest, with no rebuild.
-    raw, _, clip = select_direct_r3_clip(
-        run_dir, selected_report=record['direct_r3_clip_report'])
-    if Path(raw).resolve(strict=True) != Path(record['observed_direct_r3_mesh']).resolve(strict=True):
-        raise ValueError('Sealless Stage-2: direct-R3 source mesh differs from geometry report')
-    sfm_path = Path(record['sfm']).resolve(strict=True)
-    validate_sources(stage1, upstream, inputs, run_dir, clip, sfm_path)
 
     main = trimesh.load(mesh_file, force='mesh', process=False)
     if not isinstance(main, trimesh.Trimesh):
@@ -149,8 +164,6 @@ def validate_parity_geometry(manifest, geometry_report, *, config_file=None):
         'original_r3_boundary_preserved': bool(part.get('original_r3_boundary_preserved', False)),
         'main_vertex_fan_issue_count': int(part.get('main_vertex_fan_issue_count', 0)),
     }
-    cfgpath = (Path(config_file).resolve(strict=True) if config_file
-               else (run_dir / 'metadata' / 'effective_scene.yaml').resolve(strict=True))
     return {
         'record': record, 'main': main, 'inputs': inputs, 'run_dir': run_dir,
         'config_file': cfgpath, 'report': report_file,
