@@ -182,7 +182,11 @@ def _check_geometry(sfm_path, mesh_path, gaussian_path, *, min_faces=100):
         notes.append('No Open3D: triangle-distance QA unavailable.')
     if not mesh.is_watertight:
         notes.append('Poisson surface is open; this is acceptable for ROI analysis but not a sealed solid.')
-    return dict(sfm_points=int(len(points)), mesh_vertices=int(len(verts)),
+    from gsrefine.geometry.poisson_support import diagnose
+    support = diagnose(mesh, points, sfm_spacing=spacing_med if 'spacing_med' in locals() else None)
+    if support['review_required']:
+        notes.append('Poisson surface has sparsely SfM-supported sampled faces; review spatial extension.')
+    return dict(poisson_support_diagnostic=support, sfm_points=int(len(points)), mesh_vertices=int(len(verts)),
                 mesh_faces=int(len(mesh.faces)), gaussian_count=int(gp.vertex_count),
                 bounds_sfm=sfm_bounds.tolist(), bounds_poisson=mesh_bounds.tolist(),
                 sampled_gaussian_nn_sfm_p20_fraction=proximity,

@@ -1,0 +1,16 @@
+{
+  "schema": "GSSceneRefine.patch.v8.3",
+  "base": "GSSceneRefine unified v8 + v8.1/v8.2 hotfix",
+  "updated": [
+    "gsrefine/roi_init/formal_pipeline.py"
+  ],
+  "tests": [
+    "tools/gsrefine_v8/test_from_roi_repeat.py"
+  ],
+  "scientific_algorithms_modified": false,
+  "sha256": {
+    "gsrefine/roi_init/formal_pipeline.py": "89ca670dc8ddc4dee921e5ed9229b37cf72a1a7d6a86d87fa2bffa84e80f2ae5",
+    "tools/gsrefine_v8/test_from_roi_repeat.py": "5e02470743676015460daccbbe6b681f5d37a76898aa117fa807c714626b4478",
+    "tools/gsrefine_v8/README_repeat_from_roi_v8_3.md": "27a3fb10a3b94700e64d9a1dfae1070f20d343113d1676952a7905e2ffc0bd15"
+  }
+}

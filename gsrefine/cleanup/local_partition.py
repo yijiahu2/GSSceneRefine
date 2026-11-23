@@ -8,7 +8,7 @@ from gsrefine.cleanup import barrier_separation_gate as gate
 from gsrefine.cleanup.roi_barrier_parity import segment_parity, UNKNOWN
 from gsrefine.cleanup.stage2_runtime import measured
 from gsrefine.cleanup.threshold_distance import exact
-from tools import audit_final_r3_global_poisson_barrier as grid
+from gsrefine.geometry import original_wall_audit as grid
 
 
 class Domain:

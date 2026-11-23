@@ -1,0 +1,9 @@
+{
+  "name": "GSSceneRefine unified engineering and official pipeline v8",
+  "base_commit": "1ebc9c06013b29f5fa71cfdeb1b0754cbd670123",
+  "modes": ["full", "stage2", "from-roi"],
+  "distance_reference": "R3-clipped original Poisson main component",
+  "space_wall": "original global Poisson largest component",
+  "full_surface_distance_ab": false,
+  "status": "requires real-scene regression tests"
+}

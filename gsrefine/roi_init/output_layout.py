@@ -77,6 +77,13 @@ def _report_summary(report, roi, config, dest, final):
         'restored_gaussians': int(final['added_gaussians']),
         'core_restored_gaussians': stages.get('stage_A', {}).get('restored_core_gaussians'),
         'safety_added_gaussians': stages.get('stage_B', {}).get('safety_added_gaussians'),
+        'quality_review': {
+            'roi_exterior_area_ratio':report.get('candidate',{}).get('initial_exterior_ratio'),
+            'roi_recovery_review_required':bool(stages.get('review_required',False)),
+            'roi_exterior_area_review_required':(float(report.get('candidate',{}).get('initial_exterior_ratio',0)) >
+                float((__import__('yaml').safe_load(Path(config).read_text(encoding='utf8')) or {}).get('guards',{}).get('max_extension_area_fraction',0.1))),
+            'poisson_faces_unvalidated':not bool(report.get('poisson_face_scoring',{}).get('enabled',False)),
+            'scientific_truth_certified':False},
         'algorithm_stage': 'Poisson-guided ROI restoration and boundary protection',
         'not_cleaned': True,
     }
@@ -162,6 +169,8 @@ def publish(out, work, roi, config, report, *, keep_diagnostics=False):
         'output_sha256': final.get('output_sha256'),
         'diagnostics_retained': bool(keep_diagnostics),
         'result_status': 'ROI_RESTORED_NOT_ANOMALY_CLEANED',
+        'stage1_masks': {'file':str(meta/'stage1_masks.npz'),
+                         'sha256':stage1_runtime.digest(meta/'stage1_masks.npz')},
     }
     for key in ('gaussian_ply', 'roi_json', 'poisson_mesh', 'clean_sfm_npz'):
         if not Path(manifest['stage2_inputs'][key]).is_file():

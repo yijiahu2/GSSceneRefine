@@ -849,7 +849,7 @@ def run(*, manifest, phase='check', clip_report=None, colmap_images=None,
             min_unobstructed_cameras=int(min_unobstructed_cameras),
             b_method=b_method,voxel_size=voxel_size,max_volume_nodes=max_volume_nodes,
             max_sfm_rays=max_sfm_rays,diagnostic_only=diagnostic_only)
-    if phase not in ('check','seal','sdf','export'):
+    if phase not in ('check','sealless','seal','sdf','export'):
         raise ValueError('Invalid phase')
     if phase != 'check' and fit_max_points not in (0, None):
         # Full core is mandatory for P95 that enters actual SDF.
@@ -890,8 +890,9 @@ def run(*, manifest, phase='check', clip_report=None, colmap_images=None,
             _write_json(preflight, record)
     else:
         _write_json(preflight, record)
-    if phase == 'check':
-        status = 'ELIGIBLE_FOR_SEAL_TRIAL' if record['preseal_eligible'] else 'BLOCKED_PRESEAL'
+    if phase in ('check','sealless'):
+        status = ('SEALLESS_GEOMETRY_PREPARED' if phase == 'sealless' else
+                  ('ELIGIBLE_FOR_SEAL_TRIAL' if record['preseal_eligible'] else 'BLOCKED_PRESEAL'))
         return {'status':status, 'preseal_report': str(preflight),
                 'topology':record['topology'], 'sfm_fit':record['sfm_fit'],
                 'main_surface':record.get('main_observed_surface'),

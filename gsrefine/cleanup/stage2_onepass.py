@@ -335,12 +335,12 @@ def _prepare_required_geometry(manifest, run_dir, *, preseal_report=None):
     from gsrefine.geometry.r3_direct_poisson_clip import run as run_direct_clip
     from gsrefine.cleanup.direct_r3_pipeline import run as run_r3_check
     _log('1/5 Preparing/validating full post-R3 SfM support')
-    sfm_file, sfm_report, sfm_reused = measured('resolve_stage2_r3_sfm')(resolve_stage2_r3_sfm)(run_dir, upstream, inputs)
+    sfm_file, sfm_report, sfm_reused = measured('resolve_stage2_r3_sfm')(resolve_stage2_r3_sfm)(run_dir, upstream, inputs, require_published_v3=True)
     _log('2/5 Preparing/validating R3-clipped ORIGINAL global Poisson')
     clip = run_direct_clip(manifest=stage1, fit_max_points=60000)
     clip_report = Path(clip['candidate_mesh']).parent / 'clip_comparison_report.json'
     _log('3/5 Preparing/validating main and auxiliary Poisson partition + FULL SfM P95')
-    result = measured('run_r3_check')(run_r3_check)(manifest=stage1, phase='check', clip_report=str(clip_report))
+    result = measured('run_r3_sealless')(run_r3_check)(manifest=stage1, phase='sealless', clip_report=str(clip_report))
     preflight = Path(result['preseal_report']).resolve(strict=True)
     # Historical phase=check can return BLOCKED_PRESEAL when a complex R3
     # produces multiple open rings. That verdict applied ONLY to artificial
@@ -380,7 +380,7 @@ def run(*, manifest, output_dir, preseal_report=None, barrier_audit_dir=None,
         parity_dir=None, index_cache=None, exterior_seed=None,
         accept_auto_exterior=False, reclassify=False, chunk_size=30000, nearest_k=8,
         min_path_agree=2, ray_batch=8000, export_auxiliary_preview=True,
-        keep_classification_previews=False, auxiliary_protection_enabled=True, classifier=None, partition_report=None):
+        keep_classification_previews=False, auxiliary_protection_enabled=True, classifier=None, partition_report=None, audit_aux_ablation=False):
     """Publish a single cleaned Gaussian scene, not just detached protected fragments."""
     from gsrefine.cleanup.sdf_common import _load_stage1_manifest
     from gsrefine.roi.core import GaussianPLY
@@ -434,7 +434,7 @@ def run(*, manifest, output_dir, preseal_report=None, barrier_audit_dir=None,
                              seed=exterior_seed, chunk=chunk_size, nearest_k=nearest_k,
                              min_agree=min_path_agree, protect=auxiliary_protection_enabled,
                              previews=keep_classification_previews, aux_preview=export_auxiliary_preview, partition_report=partition_report,
-                             original_mode=classifier == 'original-region')
+                             original_mode=classifier == 'original-region', aux_ablation=audit_aux_ablation)
         # After geometry generation, a previously missing R3 handoff may now exist.
         if audit_dir is None and barrier_audit_dir is None:
             from gsrefine.geometry.r3_direct_poisson_clip import _source_r3_handoff
@@ -626,6 +626,8 @@ def main(argv=None):
     p.add_argument('--nearest-k', type=int, default=8)
     p.add_argument('--min-path-agree', type=int, default=2)
     p.add_argument('--ray-batch', type=int, default=8000)
+    p.add_argument('--audit-aux-ablation', action='store_true',
+                   help='When auxiliary protection is OFF, compute a read-only counterfactual')
     p.add_argument('--no-aux-protection', action='store_true',
                    help='ABlATION: disable auxiliary Poisson distance protection; all outside candidates are removed')
     p.add_argument('--no-aux-preview', action='store_true', help='Skip optional auxiliary protected diagnostics PLY')
@@ -644,7 +646,7 @@ def main(argv=None):
                  min_path_agree=a.min_path_agree, ray_batch=a.ray_batch,
                  export_auxiliary_preview=not a.no_aux_preview,
                  keep_classification_previews=a.keep_classification_previews,
-                 auxiliary_protection_enabled=not a.no_aux_protection)
+                 auxiliary_protection_enabled=not a.no_aux_protection, audit_aux_ablation=a.audit_aux_ablation)
     print(json.dumps(_native({'status':result['status'],
         'final_gaussian':result['outputs']['final_supersplat_gaussian_ply'],
         'removed':result['counts']['final_removed'],

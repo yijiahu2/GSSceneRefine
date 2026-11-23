@@ -382,11 +382,11 @@ def run(*, manifest, fit_max_points=60000,
     # edge-connected face component; SECOND clip ONLY that original main with
     # FINAL R3; THIRD select the largest post-clip component as the distance
     # surface (in direct_r3_pipeline), recording all post-clip auxiliaries.
-    from tools.audit_final_r3_global_poisson_barrier import largest_original_component
+    from gsrefine.geometry.original_wall_audit import largest_original_component
     full_global_topology = _topology(global_mesh)
     global_mesh, original_main_info = largest_original_component(global_mesh)
     source_verts = np.asarray(global_mesh.vertices, np.float64)
-    from tools.audit_final_r3_global_poisson_barrier import vertex_margins
+    from gsrefine.geometry.original_wall_audit import vertex_margins
     signed = vertex_margins(global_mesh, margin_fn, query_batch)
     # Finite alias audit: a nonlinear R3 union can intersect a triangle even
     # when all three corner signs agree.  Report, do NOT silently fix interiors

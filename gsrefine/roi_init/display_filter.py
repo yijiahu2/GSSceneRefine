@@ -84,6 +84,7 @@ class PoissonDisplayFilter:
         self._watertight = None
         self._mode = None
         self._cache = None
+        self._preview_dir = None
         self._previews = {}
         self._identity = None
 
@@ -143,8 +144,10 @@ class PoissonDisplayFilter:
         if self._identity == key and self._signed is not None:
             return
         self._ply = GaussianPLY(self.settings.gaussian_ply)
-        self._cache = Path(self.settings.out_dir) / '.poisson_display_cache'
+        self._cache = Path(self.settings.out_dir).parent / 'geometry' / 'display_distance_cache'
         self._cache.mkdir(parents=True, exist_ok=True)
+        self._preview_dir = Path(self.settings.out_dir) / '.poisson_display_cache'
+        self._preview_dir.mkdir(parents=True, exist_ok=True)
         distance_file = self._cache / f'distance_{key}.npy'
         meta_file = self._cache / f'distance_{key}.json'
         if distance_file.exists() and meta_file.exists():
@@ -180,12 +183,12 @@ class PoissonDisplayFilter:
         with self._lock:
             self._prepare()
             key = (self._identity, multiplier)
-            outfile = self._cache / f'preview_{key[0]}_{multiplier:.2f}.ply'
+            outfile = self._preview_dir / f'preview_{key[0]}_{multiplier:.2f}.ply'
             if not outfile.is_file() or outfile.stat().st_size < self._ply.data_offset:
                 mask = keep_for_preview(self._signed, self._base, multiplier)
                 if not mask.any():
                     raise RuntimeError('Filter would display zero Gaussians; raw display remains available')
-                tmp = self._cache / f'preview_{key[0]}_{multiplier:.2f}.tmp.ply'
+                tmp = self._preview_dir / f'preview_{key[0]}_{multiplier:.2f}.tmp.ply'
                 try:
                     count = self._ply.export(mask, tmp)
                     os.replace(tmp, outfile)
@@ -201,7 +204,7 @@ class PoissonDisplayFilter:
             print(f'[roi-init] 临时显示过滤：{multiplier:.2f}×，保留 {count:,}/{self._ply.vertex_count:,} Gaussian（仅预览）', flush=True)
             # Preview models can be GB-sized: retain at most the three newest
             # variants per source to avoid filling the archive drive.
-            candidates = sorted(self._cache.glob(f'preview_{key[0]}_*.ply'),
+            candidates = sorted(self._preview_dir.glob(f'preview_{key[0]}_*.ply'),
                                 key=lambda item:item.stat().st_mtime_ns, reverse=True)
             for stale in candidates[3:]:
                 if stale != outfile:

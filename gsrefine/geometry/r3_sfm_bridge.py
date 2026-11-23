@@ -271,6 +271,10 @@ def _select_clean_rows(fields, clean_sfm_npz, handoff_file):
                   context_only_points=int((build & ~core).sum()),
                   r3_geometric_core_sfm_points=int(np.sum(d <= tol)),
                   boundary_projection_failures=int(np.count_nonzero(residual > projection_tolerance)),
+                  boundary_projection_failure_cross_tab=dict(
+                      core_1x=int(np.count_nonzero((residual > projection_tolerance) & core)),
+                      context_2x=int(np.count_nonzero((residual > projection_tolerance) & build & ~core)),
+                      outside_2x=int(np.count_nonzero((residual > projection_tolerance) & ~build))),
                   boundary_projection_tolerance=projection_tolerance,
                   minimum_radius=float(r.min()), median_radius=float(np.median(r)),
                   maximum_radius=float(r.max()),
@@ -468,7 +472,7 @@ def _recompute_original_r3_field(run_dir, inputs, upstream, work_dir):
         safety_config=safety_cfg, gaussian_positions=xyz, major_axes=axes)
 
 
-def resolve_stage2_r3_sfm(run_dir, upstream, inputs, *, local_safety_file=None):
+def resolve_stage2_r3_sfm(run_dir, upstream, inputs, *, local_safety_file=None, require_published_v3=False):
     """Stage-2 only: prefer exact Stage-1 v3, or refit R3 *support* for old runs."""
     run_dir = Path(run_dir)
     # The Stage-1 manifest normally records the full model source.
@@ -503,6 +507,8 @@ def resolve_stage2_r3_sfm(run_dir, upstream, inputs, *, local_safety_file=None):
         if local_safety_file and candidate == Path(local_safety_file):
             raise ValueError('Explicit Stage-1 local safety record is not post-restoration R3 v3')
         # Ignore historical v1/v2 *for discovery*, never re-label as R3 v3.
+    if require_published_v3 and (record is None or record.resolve() != (run_dir/'metadata'/PUBLISHED_NAME).resolve()):
+        raise ValueError('Formal Stage 2 requires exact published Stage-1 R3 v3 handoff; legacy fallback disabled')
     if record is None:
         # A historical Stage-1 v2 file is deliberately not treated as exact R3.
         folder = run_dir/'cleanup/inputs'

@@ -78,12 +78,13 @@ def _parser():
     anchor.add_argument('--accept-auto-exterior', action='store_true')
     anchor.add_argument('--exterior-seed', nargs=3, type=float, metavar=('X', 'Y', 'Z'))
     from gsrefine.cleanup.adaptive_voxel import CLASSIFIERS
-    stage2.add_argument('--classifier', choices=(*CLASSIFIERS, 'local-region', 'original-region'), default='adaptive-voxel',
+    stage2.add_argument('--classifier', choices=(*CLASSIFIERS, 'local-region', 'original-region'), default='original-region',
                         help='Candidate side query after the Stage-2 distance threshold')
     stage2.add_argument('--compare-stage2', help='Compare A without auxiliary protection to an existing Stage-2 result directory')
     stage2.add_argument('--partition-report', help='Existing original-wall A/B report for this ROI')
     stage2.add_argument('--stage2-name', default='stage2_final_v1')
     stage2.add_argument('--no-aux-protection', action='store_true')
+    stage2.add_argument('--audit-aux-ablation', action='store_true')
     stage2.add_argument('--no-aux-preview', action='store_true')
     stage2.add_argument('--keep-classification-previews', action='store_true')
     stage2.add_argument('--reclassify', action='store_true')
@@ -204,7 +205,7 @@ def _stage2_command(a, manifest, output):
         command.append('--accept-auto-exterior')
     if a.exterior_seed is not None:
         command.extend(['--exterior-seed', *(str(x) for x in a.exterior_seed)])
-    for attr in ('no_aux_protection', 'no_aux_preview', 'keep_classification_previews', 'reclassify'):
+    for attr in ('no_aux_protection', 'no_aux_preview', 'keep_classification_previews', 'reclassify', 'audit_aux_ablation'):
         if getattr(a, attr):
             command.append('--' + attr.replace('_', '-'))
     return command
@@ -239,6 +240,16 @@ def _state_path(roi_run):
     return roi_run / 'metadata' / 'full_pipeline_status.json'
 
 
+def _code_identity():
+    repo = Path(__file__).resolve().parents[2]
+    def git(*args):
+        result = subprocess.run(['git','-C',str(repo),*args], stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, check=False)
+        return result.stdout.strip() if result.returncode == 0 else None
+    return dict(git_head=git('rev-parse','HEAD'), git_dirty=bool(git('status','--porcelain')),
+                implementation='engineering_unified_v8')
+
+
 def _write_state(roi_run, stage, manifest, output=None, *, extra=None):
     path = _state_path(roi_run)
     previous = _read_json(path) if path.is_file() else {}
@@ -251,6 +262,7 @@ def _write_state(roi_run, stage, manifest, output=None, *, extra=None):
         'manifest': str(manifest), 'manifest_sha256': _sha(manifest),
         'stage2_output_dir': str(output) if output is not None else None,
         'attempt_history': history,
+        'execution_code': _code_identity(),
     }
     if extra:
         record.update(extra)
@@ -294,7 +306,13 @@ def run(a):
                                     {'COMPLETED':'cleaned_gaussian', 'PARTIAL_VERIFIED_ROI_CLEANUP':'partially_cleaned_gaussian',
                                      'NO_VERIFIED_CLEANUP_SCOPE':'retained_stage1_gaussian'}[terminal]: str(clean),
                                     'stage2_report': str(stage2_dir/'stage2_final_report.json'),
-                                    'counts': report.get('counts', {})})
+                                    'counts': report.get('counts', {}),
+                                    'quality_review': {
+                                        'auto_exterior_seed_is_provisional': bool(a.accept_auto_exterior),
+                                        'stage1':_read_json(roi_run/'metadata'/'processing_report.json').get('quality_review',{}),
+                                        'stage2_unverified_gaussians': report.get('counts',{}).get('unverified_retained'),
+                                        'engineering_audit':report.get('engineering_audit'),
+                                        'truth_certified':False}})
         print('[full-pipeline] '+terminal+' '+str(clean), flush=True)
         return state
     except BaseException as exc:

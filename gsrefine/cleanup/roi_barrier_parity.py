@@ -263,7 +263,7 @@ def _prepare_geometry(manifest, preseal_report, *, config_file=None, with_interi
     # not a geometric prerequisite for original-Poisson parity classification.
     from gsrefine.cleanup.stage2_geometry_validation import validate_parity_geometry
     from gsrefine.geometry.r3_direct_poisson_clip import _restore_r3_field, _source_r3_handoff
-    from tools.audit_final_r3_global_poisson_barrier import largest_original_component, make_scene
+    from gsrefine.geometry.original_wall_audit import largest_original_component, make_scene
     checked = validate_parity_geometry(manifest, preseal_report, config_file=config_file)
     record, main, inputs, run_dir = (checked[k] for k in ('record', 'main', 'inputs', 'run_dir'))
     cfg, preseal = checked['config_file'], checked['report']
@@ -319,7 +319,7 @@ def _navigation_identity(audit_report, grid_path, *, roi_link_samples=3):
 @measured('make_navigation')
 def _make_navigation(grid_path, field, up, wall_scene, o3d, normals, *,
                      exterior_seed=None, neighbour_rays_batch=8000, roi_link_samples=3):
-    from tools.audit_final_r3_global_poisson_barrier import (
+    from gsrefine.geometry.original_wall_audit import (
         grid_centers, neighbour_pairs, link_r3_filter, choose_top_bottom_seeds, eval_r3)
     with np.load(grid_path, allow_pickle=False) as g:
         origin = np.asarray(g['origin'], float)
@@ -395,7 +395,7 @@ def _make_navigation(grid_path, field, up, wall_scene, o3d, normals, *,
 @measured('ray_navigation_tree_build')
 def _ray_navigation_tree(index):
     from scipy.spatial import cKDTree
-    from tools.audit_final_r3_global_poisson_barrier import grid_centers
+    from gsrefine.geometry.original_wall_audit import grid_centers
 
     labels = np.asarray(index['labels'], np.int8).ravel()
     available = np.flatnonzero(labels != UNKNOWN)
@@ -421,7 +421,7 @@ def _query_nearby_candidates(points, index, field, scene, o3d, normals, *,
     numerical/topological query; the formal-clean export is blocked if any
     over-threshold centre has this state.
     """
-    from tools.audit_final_r3_global_poisson_barrier import eval_r3, link_r3_filter
+    from gsrefine.geometry.original_wall_audit import eval_r3, link_r3_filter
 
     pts = np.asarray(points, np.float64).reshape(-1, 3)
     if not np.isfinite(pts).all():
@@ -564,7 +564,7 @@ def run_roi_barrier_parity(*, manifest, preseal_report, output_dir,
     from gsrefine.cleanup.stage2_geometry_validation import GAUSSIAN_DISTANCE_DEFAULTS as DEFAULTS
     from gsrefine.geometry.r3_direct_poisson_clip import _source_r3_handoff
     from gsrefine.cleanup.sdf_common import _load_stage1_manifest
-    from tools.audit_final_r3_global_poisson_barrier import run as audit_run
+    from gsrefine.geometry.original_wall_audit import run as audit_run
     import argparse
 
     if (chunk_size < 100 or nearest_k < min_agree or min_agree < 2 or nearest_k > 32

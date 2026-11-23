@@ -8,9 +8,9 @@ from gsrefine.cleanup import local_partition as geom
 from gsrefine.cleanup.local_voxels import RegionTree, classify
 from gsrefine.cleanup.roi_barrier_parity import _prepare_geometry, _query_nearby_candidates
 from gsrefine.cleanup.sdf_common import robust_gaussian_radius
-from gsrefine.cleanup.stage2_runtime import file_digest, measured, snapshot
+from gsrefine.cleanup.stage2_runtime import file_digest, measured, snapshot, timed
 from gsrefine.cleanup.threshold_distance import exact
-from tools import audit_final_r3_global_poisson_barrier as grid
+from gsrefine.geometry import original_wall_audit as grid
 
 FULL = 'COMPLETED_EXPERIMENTAL_CLEAN_ROI_GAUSSIAN'
 PARTIAL = 'PARTIAL_VERIFIED_ROI_CLEANUP'
@@ -160,7 +160,7 @@ def establish(data, lo, hi, h, seed, diagnostics):
 
 
 def run(stage1, preseal, out, model, *, seed, chunk, nearest_k, min_agree,
-        protect, previews, aux_preview, partition_report=None, original_mode=False):
+        protect, previews, aux_preview, partition_report=None, original_mode=False, aux_ablation=False):
     from gsrefine.cleanup.stage2_onepass import _atomic_json, _export_native, _auxiliary_protection
     from gsrefine.cleanup.stage2_geometry_validation import GAUSSIAN_DISTANCE_DEFAULTS as defaults
     from gsrefine.roi.core import ROI
@@ -180,7 +180,7 @@ def run(stage1, preseal, out, model, *, seed, chunk, nearest_k, min_agree,
             lo = index['origin']
             hi = lo + np.asarray(index['shape'])*index['voxel']
         else:
-            from tools.test_r3_original_walls import source_groups
+            from gsrefine.geometry.original_wall_source import source_groups
             wall, _, sizes = source_groups(data['orig_global'])
             domain = geom.Domain(data['field'])
             h = float(np.ptp(points, axis=0).max()/60.)
@@ -219,7 +219,7 @@ def run(stage1, preseal, out, model, *, seed, chunk, nearest_k, min_agree,
         _atomic_json(diagnostics/'window.json',win)
         index, mesh, aux, fit, domain, scope = establish(data,lo,hi,h0,seed,diagnostics)
         wall = mesh
-    radii = robust_gaussian_radius(model, defaults['trim_fraction'], defaults['sigma_multiplier'])
+    radii = measured('gaussian_radius_statistics')(robust_gaussian_radius)(model, defaults['trim_fraction'], defaults['sigma_multiplier'])
     delta = float(fit['p95']+radii['trimmed_mean_radius'])
     tau = delta+defaults['epsilon']
     info = {}
@@ -236,11 +236,11 @@ def run(stage1, preseal, out, model, *, seed, chunk, nearest_k, min_agree,
                 roi_link_samples=7)
         guard = 32*np.finfo(np.float32).eps*max(1.,abs(lo).max(),abs(hi).max(),
                                                   np.abs(mesh.bounds).max(), np.abs(wall.bounds).max())
-        tree = RegionTree(index,domain,distance,tau,guard,
+        tree = measured('region_tree_build')(RegionTree)(index,domain,distance,tau,guard,
                           wall_distance=wall_distance if original else None)
         if original and tree.conflicts:
             info['initial_voxel_conflicts'] = tree.conflicts
-            tree = RegionTree(index,domain,distance,tau,guard,wall_distance=wall_distance,
+            tree = measured('region_tree_conflict_rebuild')(RegionTree)(index,domain,distance,tau,guard,wall_distance=wall_distance,
                               refine_keys=tree.conflict_keys)
             info['unresolved_voxel_conflicts'] = tree.conflicts
         if tree.conflicts and not original:
@@ -260,7 +260,7 @@ def run(stage1, preseal, out, model, *, seed, chunk, nearest_k, min_agree,
                 def radius(p):
                     return np.maximum(0., np.minimum(domain.interior_radius(p), wall_distance(p)) - guard)
 
-                cover = RegionCover(index, tree, radius)
+                cover = measured('region_cover_build')(RegionCover)(index, tree, radius)
             outside, inside, withheld, lookup = classify(
                 points, tree, domain, distance, tau, rays,
                 batch=chunk, region_cover=cover)
@@ -277,6 +277,9 @@ def run(stage1, preseal, out, model, *, seed, chunk, nearest_k, min_agree,
         inside = outside.copy()
         withheld = ~outside
     protected = np.zeros(len(points),bool)
+    shadow_protected = None
+    if aux_ablation and not protect and outside.any() and aux:
+        shadow_protected, _, _ = _auxiliary_protection(model,outside,delta,aux,chunk_size=chunk)
     if protect and outside.any() and aux:
         protected, _, _ = _auxiliary_protection(model,outside,delta,aux,chunk_size=chunk)
     remove = outside & ~protected
@@ -302,12 +305,33 @@ def run(stage1, preseal, out, model, *, seed, chunk, nearest_k, min_agree,
         for name, mask in [('outside_candidates',outside),('inside_labelled',inside),('unverified',withheld)]:
             if mask.any():
                 _export_native(model,mask,diagnostics/(name+'.ply'))
+    # Read-only deleted-Gaussian risk, exterior seed and cross-stage attribution.
+    from gsrefine.cleanup.engineering_audit import cross_stage, classification_risk
+    import json as _json
+    with timed('engineering_cross_stage_and_risk_audit'):
+        engineering = {
+            'cross_stage': cross_stage(Path(stage1).parent.parent, inputs['gaussian_ply'],
+                                      remove, input_count=len(points)),
+            'risk': classification_risk(points=points, remove=remove, outside=outside,
+                        withheld=withheld, protected=protected, delta=delta, scope=scope),
+            'auxiliary_ablation': dict(
+                        status=('COUNTERFACTUAL_SAME_CLASSIFICATION' if protect or shadow_protected is not None
+                                else 'NOT_COMPUTED_NO_AUXILIARY_RUN'),
+                        protection_enabled=bool(protect),
+                        removed_if_auxiliary_off=int(outside.sum()),
+                        removed_with_protection=(int(outside.sum()-(protected if protect else shadow_protected).sum())
+                                if protect or shadow_protected is not None else None),
+                        extra_removed_without_protection=(int((protected if protect else shadow_protected).sum())
+                                if protect or shadow_protected is not None else None),
+                        note='Counterfactual reuses same side and distance classifications; does not edit final mask.'),
+        }
+        _atomic_json(diagnostics/'engineering_audit.json',engineering)
     if aux_preview and protected.any():
         _export_native(model,protected,diagnostics/'aux_protected_gaussians.ply')
     counts = dict(input_gaussians=len(points), outside_before_aux=int(outside.sum()),
                   protected_by_all_aux=int(protected.sum()),final_removed=int(remove.sum()),
                   final_retained=int(keep.sum()),unverified_retained=int(withheld.sum()))
-    result = dict(schema='GSSceneRefine.local_region.v1',status=status,
+    result = dict(schema='GSSceneRefine.local_region.v1',status=status,engineering_audit=str(diagnostics/'engineering_audit.json'),quality_review_required=bool(withheld.any() or seed is None),
         input=dict(stage1_manifest=str(stage1),stage1_manifest_sha256=file_digest(stage1),
                    original_roi_gaussian=str(inputs['gaussian_ply']),
                    original_roi_gaussian_sha256=file_digest(inputs['gaussian_ply']),
@@ -327,6 +351,7 @@ def run(stage1, preseal, out, model, *, seed, chunk, nearest_k, min_agree,
         writer=csv.writer(stream)
         writer.writerow(['项目','次数','含子步骤秒数','独占秒数'])
         writer.writerow(['阶段二主程序至汇总',1,timing['total_s'],''])
+        writer.writerow(['未归类开销',1,'',timing['other_s']])
         for name,item in timing['steps'].items():
             writer.writerow([name,item['calls'],item['inclusive_s'],item['exclusive_s']])
     _atomic_json(out/'stage2_final_report.json',result)

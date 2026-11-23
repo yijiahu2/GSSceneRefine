@@ -19,7 +19,7 @@ SCHEMA = 'GSSceneRefine.R3_original_wall_region_separation.v2'
 
 
 def _centers(origin, h, shape):
-    from tools.audit_final_r3_global_poisson_barrier import grid_centers
+    from gsrefine.geometry.original_wall_audit import grid_centers
     return grid_centers(origin, h, shape)
 
 
@@ -88,7 +88,7 @@ def _select_local_pairs(a, b, xyz, h, *, limit=120, radius=5.):
 
 def _pairs_test(grid, a, b, field, wall_scene, o3d, normals, *, max_pairs=120):
     from gsrefine.cleanup.roi_barrier_parity import segment_parity
-    from tools.audit_final_r3_global_poisson_barrier import link_r3_filter
+    from gsrefine.geometry.original_wall_audit import link_r3_filter
 
     labels = grid['regions'].ravel()
     pairs = _select_local_pairs(labels == a, labels == b, grid['xyz'],grid['voxel'],limit=max_pairs)

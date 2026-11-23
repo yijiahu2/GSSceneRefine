@@ -227,6 +227,30 @@ def run_once(config, roi, output_dir=None, *, reuse_scene_roi=False,
         if recovered is not None and safety is not None:
             if int(recovered) + int(safety) != int(final['added_gaussians']):
                 raise RuntimeError('R3 recovery counts do not sum to final added count')
+        # Persist scientific selection partitions BEFORE publish moves/deletes work.
+        import numpy as np
+        stage1_masks = {
+            'R0': np.load(work/'keep_mask_R0.npy', allow_pickle=False).astype(np.bool_),
+            'core': np.load(work/'core_mask_R3.npy', allow_pickle=False).astype(np.bool_),
+            'safety': np.load(work/'safety_added_mask_R3.npy', allow_pickle=False).astype(np.bool_),
+            'R3': np.load(work/'keep_mask_R3.npy', allow_pickle=False).astype(np.bool_),
+        }
+        if (any(x.shape != stage1_masks['R0'].shape for x in stage1_masks.values())
+                or not np.array_equal(stage1_masks['core']|stage1_masks['safety'],stage1_masks['R3'])
+                or np.any(stage1_masks['core']&stage1_masks['safety'])
+                or np.any(stage1_masks['R0']&~stage1_masks['core'])):
+            raise RuntimeError('Stage-1 R3 scientific mask partition inconsistent')
+        metadata = out/'metadata'
+        metadata.mkdir(parents=True,exist_ok=True)
+        mask_path = metadata/'stage1_masks.npz'
+        np.savez_compressed(mask_path, **stage1_masks)
+        from gsrefine.cleanup.engineering_audit import _digest
+        write_atomic(metadata/'stage1_masks_integrity.json', {
+            'schema':'GSSceneRefine.stage1_masks.v1', 'sha256':_digest(mask_path),
+            'r3_ply':str((out/FINAL_REL).resolve()),
+            'full_input_count':int(len(stage1_masks['R3'])),
+            'r3_count':int(stage1_masks['R3'].sum()),
+            'note':'Masks preserve full-source Gaussian row order; Stage-2 PLY is R3 subsequence.'})
         model, manifest, summary = publish(out, work, roi, config, report,
                                            keep_diagnostics=keep_diagnostics)
     result = {

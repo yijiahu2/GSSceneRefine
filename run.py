@@ -25,6 +25,7 @@ COMMANDS = {
     'ui':'gsrefine.web.server',
     'roi-init':'gsrefine.roi_init.server',
     'full-pipeline':'gsrefine.roi_init.full_pipeline',
+    'pipeline':'gsrefine.roi_init.formal_pipeline',
     'roi-auto':'gsrefine.roi_init.workflow',
     'roi-status':'gsrefine.roi_init.status',
     'orientation':'gsrefine.geometry.diagnose_orientation',
